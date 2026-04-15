@@ -2,7 +2,7 @@
 
 ## Overview
 
-pnpm workspace monorepo using TypeScript. Each package manages its own dependencies.
+pnpm workspace monorepo using TypeScript. Includes a Telegram bot for Ava Max social media updates.
 
 ## Stack
 
@@ -12,9 +12,20 @@ pnpm workspace monorepo using TypeScript. Each package manages its own dependenc
 - **TypeScript version**: 5.9
 - **API framework**: Express 5
 - **Database**: PostgreSQL + Drizzle ORM
+- **Telegram Bot**: node-telegram-bot-api (polling mode)
 - **Validation**: Zod (`zod/v4`), `drizzle-zod`
 - **API codegen**: Orval (from OpenAPI spec)
 - **Build**: esbuild (CJS bundle)
+
+## Telegram Bot
+
+- **Entry point**: `artifacts/api-server/src/bot.ts`
+- **DB schema**: `lib/db/src/schema/connectedChats.ts` — tracks groups/channels the bot is added to
+- **Authorized user**: @BeRichAsFreh (only user who can use /publicforward)
+- **Commands**:
+  - `/start` — Welcome message with "Add to Group/Channel" button
+  - `/publicforward` — (hidden, admin-only) Forward a message with optional URL buttons to all connected chats
+- **Secrets**: `TELEGRAM_BOT_TOKEN`
 
 ## Key Commands
 
