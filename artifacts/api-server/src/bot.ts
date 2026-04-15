@@ -36,9 +36,7 @@ export function startBot() {
 
   bot.on("new_chat_members", async (msg) => {
     const botUser = await bot.getMe();
-    const botAdded = msg.new_chat_members?.some(
-      (m) => m.id === botUser.id
-    );
+    const botAdded = msg.new_chat_members?.some((m) => m.id === botUser.id);
     if (botAdded && msg.chat.id) {
       try {
         await db
@@ -54,10 +52,7 @@ export function startBot() {
         const addedByUserId = msg.from?.id;
         if (addedByUserId) {
           try {
-            await bot.sendMessage(
-              addedByUserId,
-              "Your channel will now be updated ✅"
-            );
+            await bot.sendMessage(addedByUserId, "Your channel will now be updated ✅");
           } catch {
             // user may not have started the bot yet
           }
@@ -92,10 +87,7 @@ export function startBot() {
         const addedByUserId = update.from?.id;
         if (addedByUserId) {
           try {
-            await bot.sendMessage(
-              addedByUserId,
-              "Your channel will now be updated ✅"
-            );
+            await bot.sendMessage(addedByUserId, "Your channel will now be updated ✅");
           } catch {
             // user may not have started the bot yet
           }
@@ -168,7 +160,7 @@ export function startBot() {
     if (!state) return;
 
     if (query.data === "skip_buttons" || query.data === "done_buttons") {
-      await sendToAllChats(bot, state, query.message.chat.id);
+      await sendToAllChats(bot, token, state, query.message.chat.id);
       userStates.delete(userId);
     } else if (query.data === "add_button") {
       state.step = "awaiting_button_text";
@@ -252,8 +244,38 @@ export function startBot() {
   return bot;
 }
 
+async function copyMessageViaApi(
+  token: string,
+  chatId: string,
+  fromChatId: number,
+  messageId: number,
+  replyMarkup?: object
+): Promise<void> {
+  const body: Record<string, unknown> = {
+    chat_id: chatId,
+    from_chat_id: fromChatId,
+    message_id: messageId,
+  };
+
+  if (replyMarkup) {
+    body["reply_markup"] = replyMarkup;
+  }
+
+  const res = await fetch(`https://api.telegram.org/bot${token}/copyMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`copyMessage failed: ${res.status} ${text}`);
+  }
+}
+
 async function sendToAllChats(
   bot: TelegramBot,
+  token: string,
   state: UserState,
   adminChatId: number
 ) {
@@ -264,51 +286,30 @@ async function sendToAllChats(
     return;
   }
 
-  const inlineKeyboard =
+  const originalMsg = state.message!;
+
+  const replyMarkup =
     state.buttons.length > 0
       ? {
-          reply_markup: {
-            inline_keyboard: state.buttons.map((b) => [
-              { text: b.text, url: b.url },
-            ]),
-          },
+          inline_keyboard: state.buttons.map((b) => [{ text: b.text, url: b.url }]),
         }
       : undefined;
 
   let successCount = 0;
   let failCount = 0;
-  const originalMsg = state.message!;
 
   for (const chat of chats) {
     try {
       const chatId = chat.chatId.toString();
 
-      if (originalMsg.photo) {
-        const photo = originalMsg.photo[originalMsg.photo.length - 1];
-        await bot.sendPhoto(chatId, photo.file_id, {
-          caption: originalMsg.caption || undefined,
-          ...(inlineKeyboard || {}),
-        } as any);
-      } else if (originalMsg.video) {
-        await bot.sendVideo(chatId, originalMsg.video.file_id, {
-          caption: originalMsg.caption || undefined,
-          ...(inlineKeyboard || {}),
-        } as any);
-      } else if (originalMsg.document) {
-        await bot.sendDocument(chatId, originalMsg.document.file_id, {
-          caption: originalMsg.caption || undefined,
-          ...(inlineKeyboard || {}),
-        } as any);
-      } else if (originalMsg.audio) {
-        await bot.sendAudio(chatId, originalMsg.audio.file_id, {
-          caption: originalMsg.caption || undefined,
-          ...(inlineKeyboard || {}),
-        } as any);
-      } else if (originalMsg.sticker) {
-        await bot.sendSticker(chatId, originalMsg.sticker.file_id, inlineKeyboard as any);
-      } else if (originalMsg.text) {
-        await bot.sendMessage(chatId, originalMsg.text, inlineKeyboard);
-      }
+      await copyMessageViaApi(
+        token,
+        chatId,
+        originalMsg.chat.id,
+        originalMsg.message_id,
+        replyMarkup
+      );
+
       successCount++;
     } catch (err) {
       failCount++;
