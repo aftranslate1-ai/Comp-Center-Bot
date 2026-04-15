@@ -121,8 +121,12 @@ export function startBot() {
           inline_keyboard: [
             [
               {
-                text: "➕ Add to Group or Channel",
+                text: "➕ Add to Group",
                 url: `https://t.me/${botInfo.username}?startgroup=true`,
+              },
+              {
+                text: "➕ Add to Channel",
+                url: `https://t.me/${botInfo.username}?startchannel=true`,
               },
             ],
           ],
