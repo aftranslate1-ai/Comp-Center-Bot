@@ -34,6 +34,22 @@ export function startBot() {
   const bot = new TelegramBot(token, { polling: true });
   logger.info("Telegram bot started");
 
+  bot.on("polling_error", (err) => {
+    logger.error({ err: err.message }, "Telegram polling error — continuing");
+  });
+
+  bot.on("error", (err) => {
+    logger.error({ err: err.message }, "Telegram bot error — continuing");
+  });
+
+  process.on("uncaughtException", (err) => {
+    logger.error({ err }, "Uncaught exception — continuing");
+  });
+
+  process.on("unhandledRejection", (reason) => {
+    logger.error({ reason }, "Unhandled promise rejection — continuing");
+  });
+
   bot.on("new_chat_members", async (msg) => {
     const botUser = await bot.getMe();
     const botAdded = msg.new_chat_members?.some((m) => m.id === botUser.id);
@@ -110,94 +126,94 @@ export function startBot() {
   });
 
   bot.onText(/\/start/, async (msg) => {
-    if (msg.chat.type !== "private") return;
+    try {
+      if (msg.chat.type !== "private") return;
 
-    const botInfo = await bot.getMe();
-    await bot.sendMessage(
-      msg.chat.id,
-      "Add me to a group or channel so I can update it with new posts from all Ava Max's social medias for you 🎤",
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              {
-                text: "➕ Add to Group",
-                url: `https://t.me/${botInfo.username}?startgroup=true`,
-              },
-              {
-                text: "➕ Add to Channel",
-                url: `https://t.me/${botInfo.username}?startchannel=true`,
-              },
+      const botInfo = await bot.getMe();
+      await bot.sendMessage(
+        msg.chat.id,
+        "Add me to a group or channel so I can update it with new posts from all Ava Max's social medias for you 🎤",
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: "➕ Add to Group",
+                  url: `https://t.me/${botInfo.username}?startgroup=true`,
+                },
+                {
+                  text: "➕ Add to Channel",
+                  url: `https://t.me/${botInfo.username}?startchannel=true`,
+                },
+              ],
             ],
-          ],
-        },
-      }
-    );
+          },
+        }
+      );
+    } catch (err) {
+      logger.error({ err }, "Error handling /start");
+    }
   });
 
   bot.onText(/\/publicforward/, async (msg) => {
-    if (msg.chat.type !== "private") return;
+    try {
+      if (msg.chat.type !== "private") return;
 
-    const username = msg.from?.username;
-    if (username !== AUTHORIZED_USERNAME) {
-      await bot.sendMessage(msg.chat.id, "This is not an available command.");
-      return;
+      const username = msg.from?.username;
+      if (username !== AUTHORIZED_USERNAME) {
+        await bot.sendMessage(msg.chat.id, "This is not an available command.");
+        return;
+      }
+
+      userStates.set(msg.from!.id, {
+        step: "awaiting_message",
+        buttons: [],
+      });
+
+      await bot.sendMessage(
+        msg.chat.id,
+        "Send me what you would like to send to all channels that this bot is connected to."
+      );
+    } catch (err) {
+      logger.error({ err }, "Error handling /publicforward");
     }
-
-    userStates.set(msg.from!.id, {
-      step: "awaiting_message",
-      buttons: [],
-    });
-
-    await bot.sendMessage(
-      msg.chat.id,
-      "Send me what you would like to send to all channels that this bot is connected to."
-    );
   });
 
   bot.on("callback_query", async (query) => {
-    if (!query.message || !query.from) return;
-    await bot.answerCallbackQuery(query.id);
+    try {
+      if (!query.message || !query.from) return;
+      await bot.answerCallbackQuery(query.id);
 
-    const userId = query.from.id;
-    const state = userStates.get(userId);
-    if (!state) return;
+      const userId = query.from.id;
+      const state = userStates.get(userId);
+      if (!state) return;
 
-    if (query.data === "skip_buttons" || query.data === "done_buttons") {
-      await sendToAllChats(bot, token, state, query.message.chat.id);
-      userStates.delete(userId);
-    } else if (query.data === "add_button") {
-      state.step = "awaiting_button_text";
-      await bot.sendMessage(
-        query.message.chat.id,
-        "Send text for your button (or send /back to go back):"
-      );
+      if (query.data === "skip_buttons" || query.data === "done_buttons") {
+        await sendToAllChats(bot, token, state, query.message.chat.id);
+        userStates.delete(userId);
+      } else if (query.data === "add_button") {
+        state.step = "awaiting_button_text";
+        await bot.sendMessage(
+          query.message.chat.id,
+          "Send text for your button (or send /back to go back):"
+        );
+      }
+    } catch (err) {
+      logger.error({ err }, "Error handling callback_query");
     }
   });
 
   bot.on("message", async (msg) => {
-    if (msg.chat.type !== "private" || !msg.from) return;
-    if (msg.text?.startsWith("/start") || msg.text?.startsWith("/publicforward")) return;
+    try {
+      if (msg.chat.type !== "private" || !msg.from) return;
+      if (msg.text?.startsWith("/start") || msg.text?.startsWith("/publicforward")) return;
 
-    const userId = msg.from.id;
-    const state = userStates.get(userId);
-    if (!state) return;
+      const userId = msg.from.id;
+      const state = userStates.get(userId);
+      if (!state) return;
 
-    if (state.step === "awaiting_message") {
-      state.message = msg;
-      state.step = "awaiting_button_choice";
-      await bot.sendMessage(msg.chat.id, "Would you like to add buttons to this message?", {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: "➕ Add Button", callback_data: "add_button" },
-              { text: "Skip", callback_data: "skip_buttons" },
-            ],
-          ],
-        },
-      });
-    } else if (state.step === "awaiting_button_text") {
-      if (msg.text === "/back") {
+      if (state.step === "awaiting_message") {
+        state.message = msg;
         state.step = "awaiting_button_choice";
         await bot.sendMessage(msg.chat.id, "Would you like to add buttons to this message?", {
           reply_markup: {
@@ -209,43 +225,88 @@ export function startBot() {
             ],
           },
         });
-        return;
-      }
-
-      state.currentButtonText = msg.text || "Button";
-      state.step = "awaiting_button_url";
-      await bot.sendMessage(msg.chat.id, "Send a link for your button:");
-    } else if (state.step === "awaiting_button_url") {
-      const url = msg.text || "";
-      state.buttons.push({
-        text: state.currentButtonText || "Button",
-        url: url,
-      });
-      state.currentButtonText = undefined;
-      state.step = "awaiting_button_choice";
-
-      const currentButtons = state.buttons
-        .map((b, i) => `${i + 1}. ${b.text} → ${b.url}`)
-        .join("\n");
-
-      await bot.sendMessage(
-        msg.chat.id,
-        `Button added! Current buttons:\n${currentButtons}\n\nWould you like to add another button?`,
-        {
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: "➕ Add Button", callback_data: "add_button" },
-                { text: "Done ✅", callback_data: "done_buttons" },
+      } else if (state.step === "awaiting_button_text") {
+        if (msg.text === "/back") {
+          state.step = "awaiting_button_choice";
+          await bot.sendMessage(msg.chat.id, "Would you like to add buttons to this message?", {
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: "➕ Add Button", callback_data: "add_button" },
+                  { text: "Skip", callback_data: "skip_buttons" },
+                ],
               ],
-            ],
-          },
+            },
+          });
+          return;
         }
-      );
+
+        state.currentButtonText = msg.text || "Button";
+        state.step = "awaiting_button_url";
+        await bot.sendMessage(msg.chat.id, "Send a link for your button:");
+      } else if (state.step === "awaiting_button_url") {
+        const url = msg.text || "";
+        state.buttons.push({
+          text: state.currentButtonText || "Button",
+          url: url,
+        });
+        state.currentButtonText = undefined;
+        state.step = "awaiting_button_choice";
+
+        const currentButtons = state.buttons
+          .map((b, i) => `${i + 1}. ${b.text} → ${b.url}`)
+          .join("\n");
+
+        await bot.sendMessage(
+          msg.chat.id,
+          `Button added! Current buttons:\n${currentButtons}\n\nWould you like to add another button?`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: "➕ Add Button", callback_data: "add_button" },
+                  { text: "Done ✅", callback_data: "done_buttons" },
+                ],
+              ],
+            },
+          }
+        );
+      }
+    } catch (err) {
+      logger.error({ err }, "Error handling message");
     }
   });
 
   return bot;
+}
+
+const BANNED_ERROR_PATTERNS = [
+  "bot was kicked",
+  "bot was blocked by the user",
+  "bot is not a member",
+  "chat not found",
+  "have no rights",
+  "not enough rights",
+  "user is deactivated",
+  "the group chat was deleted",
+  "need administrator rights",
+  "channel private",
+  "forbidden",
+];
+
+function isBanError(status: number, body: string): boolean {
+  if (status === 403) return true;
+  if (status === 400) {
+    const lower = body.toLowerCase();
+    return BANNED_ERROR_PATTERNS.some((p) => lower.includes(p));
+  }
+  return false;
+}
+
+interface CopyResult {
+  ok: boolean;
+  banned: boolean;
+  error?: string;
 }
 
 async function copyMessageViaApi(
@@ -254,7 +315,7 @@ async function copyMessageViaApi(
   fromChatId: number,
   messageId: number,
   replyMarkup?: object
-): Promise<void> {
+): Promise<CopyResult> {
   const body: Record<string, unknown> = {
     chat_id: chatId,
     from_chat_id: fromChatId,
@@ -265,15 +326,20 @@ async function copyMessageViaApi(
     body["reply_markup"] = replyMarkup;
   }
 
-  const res = await fetch(`https://api.telegram.org/bot${token}/copyMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/copyMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
 
-  if (!res.ok) {
+    if (res.ok) return { ok: true, banned: false };
+
     const text = await res.text();
-    throw new Error(`copyMessage failed: ${res.status} ${text}`);
+    const banned = isBanError(res.status, text);
+    return { ok: false, banned, error: `${res.status} ${text}` };
+  } catch (err) {
+    return { ok: false, banned: false, error: String(err) };
   }
 }
 
@@ -301,28 +367,40 @@ async function sendToAllChats(
 
   let successCount = 0;
   let failCount = 0;
+  let removedCount = 0;
 
   for (const chat of chats) {
-    try {
-      const chatId = chat.chatId.toString();
+    const chatId = chat.chatId.toString();
 
-      await copyMessageViaApi(
-        token,
-        chatId,
-        originalMsg.chat.id,
-        originalMsg.message_id,
-        replyMarkup
-      );
+    const result = await copyMessageViaApi(
+      token,
+      chatId,
+      originalMsg.chat.id,
+      originalMsg.message_id,
+      replyMarkup
+    );
 
+    if (result.ok) {
       successCount++;
-    } catch (err) {
+    } else if (result.banned) {
+      removedCount++;
+      logger.warn({ chatId, error: result.error }, "Bot banned from chat — removing from DB");
+      try {
+        await db
+          .delete(connectedChatsTable)
+          .where(eq(connectedChatsTable.chatId, BigInt(chat.chatId)));
+      } catch (dbErr) {
+        logger.error({ dbErr }, "Failed to remove banned chat from DB");
+      }
+    } else {
       failCount++;
-      logger.error({ err, chatId: chat.chatId.toString() }, "Failed to send to chat");
+      logger.error({ chatId, error: result.error }, "Failed to send to chat");
     }
   }
 
-  await bot.sendMessage(
-    adminChatId,
-    `Message sent to ${successCount} chat(s).${failCount > 0 ? ` Failed: ${failCount}.` : ""}`
-  );
+  const parts: string[] = [`Message sent to ${successCount} chat(s).`];
+  if (removedCount > 0) parts.push(`${removedCount} removed (bot was banned).`);
+  if (failCount > 0) parts.push(`${failCount} failed (will retry next broadcast).`);
+
+  await bot.sendMessage(adminChatId, parts.join(" "));
 }
