@@ -6,8 +6,6 @@ import { eq, ilike, or } from "drizzle-orm";
 
 const AUTHORIZED_USERNAME = "BeRichAsFreh";
 
-const FEEDBACK_CHAT_INVITE = "+_dKhborwYdJkYThk";
-
 const SEARCH_CHANNEL_USERNAMES = [
   "tatemcraecomp",
   "BebeRexhaLeaks",
@@ -52,19 +50,6 @@ interface UserState {
 }
 
 const userStates = new Map<number, UserState>();
-
-let feedbackChatId: number | null = null;
-
-async function resolveFeedbackChat(bot: TelegramBot) {
-  if (feedbackChatId) return feedbackChatId;
-  try {
-    const chat = await bot.getChat(`@complaintscenter` as any);
-    feedbackChatId = chat.id as number;
-    return feedbackChatId;
-  } catch {
-    return null;
-  }
-}
 
 async function searchMessages(query: string): Promise<Array<{ channelUsername: string; messageId: number; text: string }>> {
   const words = query.trim().split(/\s+/).filter(Boolean);
@@ -274,7 +259,7 @@ export async function startBot() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              chat_id: `@complaintscenter`,
+              chat_id: `@complaintsrequests`,
               text: feedbackMsg,
               parse_mode: "Markdown",
             }),
