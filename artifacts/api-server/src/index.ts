@@ -1,6 +1,7 @@
 import app from "./app";
 import { logger } from "./lib/logger";
 import { startBot } from "./bot";
+import { startScraper } from "./scraper";
 
 const rawPort = process.env["PORT"];
 
@@ -28,3 +29,10 @@ app.listen(port, (err) => {
 startBot().catch((err) => {
   logger.error({ err }, "Bot failed to start");
 });
+
+const scraperToken = process.env["TELEGRAM_BOT_TOKEN"];
+if (scraperToken) {
+  startScraper(scraperToken);
+} else {
+  logger.warn("TELEGRAM_BOT_TOKEN not set — scraper will not start");
+}

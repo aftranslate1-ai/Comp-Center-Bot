@@ -2,7 +2,7 @@ import TelegramBot from "node-telegram-bot-api";
 import { db } from "@workspace/db";
 import { connectedChatsTable, channelMessagesTable } from "@workspace/db/schema";
 import { logger } from "./lib/logger";
-import { eq, ilike, or } from "drizzle-orm";
+import { eq, ilike, or, isNotNull, and } from "drizzle-orm";
 
 const AUTHORIZED_USERNAME = "BeRichAsFreh";
 
@@ -122,13 +122,18 @@ async function searchMessages(query: string): Promise<Array<{ channelUsername: s
   const words = query.trim().split(/\s+/).filter(Boolean);
   if (words.length === 0) return [];
 
-  const conditions = words.map((w) => ilike(channelMessagesTable.messageText, `%${w}%`));
+  const textConditions = words.map((w) => ilike(channelMessagesTable.messageText, `%${w}%`));
 
   const rows = await db
     .select()
     .from(channelMessagesTable)
-    .where(or(...conditions))
-    .limit(5);
+    .where(
+      and(
+        isNotNull(channelMessagesTable.audioTitle),
+        or(...textConditions)
+      )
+    )
+    .limit(10);
 
   return rows.map((r) => ({
     channelUsername: r.channelUsername,
@@ -168,12 +173,6 @@ export async function startBot() {
     try {
       if (!msg.chat.username) return;
 
-      const username = msg.chat.username.toLowerCase();
-      const isSearchChannel = SEARCH_CHANNEL_USERNAMES.some(
-        (u) => u.toLowerCase() === username
-      );
-      if (!isSearchChannel) return;
-
       const audioTitle =
         msg.audio?.title ||
         msg.audio?.file_name ||
@@ -181,8 +180,9 @@ export async function startBot() {
         msg.video?.file_name ||
         null;
 
+      if (!audioTitle) return;
+
       const searchableParts: string[] = [];
-      if (msg.text) searchableParts.push(msg.text);
       if (msg.caption) searchableParts.push(msg.caption);
       if (msg.audio?.title) searchableParts.push(msg.audio.title);
       if (msg.audio?.performer) searchableParts.push(msg.audio.performer);
@@ -193,15 +193,16 @@ export async function startBot() {
       if (searchableParts.length === 0) return;
 
       const messageText = searchableParts.join(" ");
+      const username = msg.chat.username;
 
       await db.insert(channelMessagesTable).values({
-        channelUsername: msg.chat.username,
+        channelUsername: username,
         messageId: msg.message_id,
         messageText,
         audioTitle,
       }).onConflictDoNothing();
 
-      logger.info({ username, audioTitle, messageId: msg.message_id }, "Indexed channel post");
+      logger.info({ username, audioTitle, messageId: msg.message_id }, "Indexed audio from channel");
     } catch (err) {
       logger.error({ err }, "Error indexing channel post");
     }
