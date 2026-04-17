@@ -39,7 +39,13 @@ type UserStep =
   | "broadcast_awaiting_message"
   | "broadcast_awaiting_button_choice"
   | "broadcast_awaiting_button_text"
-  | "broadcast_awaiting_button_url";
+  | "broadcast_awaiting_button_url"
+  | "broadcast_selecting_chats";
+
+interface ConnectedChatOption {
+  chatId: string;
+  label: string;
+}
 
 interface UserState {
   step: UserStep;
@@ -47,9 +53,70 @@ interface UserState {
   feedbackText?: string;
   buttons: ButtonData[];
   currentButtonText?: string;
+  availableChats?: ConnectedChatOption[];
+  selectedChatIds?: Set<string>;
+  selectionMessageId?: number;
 }
 
 const userStates = new Map<number, UserState>();
+
+function buildChatPickerKeyboard(
+  chats: ConnectedChatOption[],
+  selectedIds: Set<string>
+): TelegramBot.InlineKeyboardButton[][] {
+  const rows: TelegramBot.InlineKeyboardButton[][] = chats.map((c) => [
+    {
+      text: `${selectedIds.has(c.chatId) ? "✅" : "☐"} ${c.label}`,
+      callback_data: `toggle_${c.chatId}`,
+    },
+  ]);
+
+  const selectedCount = selectedIds.size;
+  rows.push([
+    {
+      text: selectedCount > 0 ? `📤 Send to ${selectedCount} selected` : "📤 Select at least one",
+      callback_data: "send_selected",
+    },
+    { text: "❌ Cancel", callback_data: "cancel_broadcast" },
+  ]);
+
+  return rows;
+}
+
+async function showChatPicker(
+  bot: TelegramBot,
+  chatId: number,
+  state: UserState
+): Promise<void> {
+  const chats = await db.select().from(connectedChatsTable);
+
+  if (chats.length === 0) {
+    await bot.sendMessage(chatId, "No connected groups or channels found.");
+    userStates.delete(chatId);
+    return;
+  }
+
+  const options: ConnectedChatOption[] = chats.map((c) => ({
+    chatId: c.chatId.toString(),
+    label: c.chatTitle || `Chat ${c.chatId}`,
+  }));
+
+  state.availableChats = options;
+  state.selectedChatIds = new Set(options.map((o) => o.chatId));
+  state.step = "broadcast_selecting_chats";
+
+  const sentMsg = await bot.sendMessage(
+    chatId,
+    "Which channels/groups do you want to send this to?\nAll are selected by default — tap to deselect any.",
+    {
+      reply_markup: {
+        inline_keyboard: buildChatPickerKeyboard(options, state.selectedChatIds),
+      },
+    }
+  );
+
+  state.selectionMessageId = sentMsg.message_id;
+}
 
 async function searchMessages(query: string): Promise<Array<{ channelUsername: string; messageId: number; text: string; audioTitle: string | null }>> {
   const words = query.trim().split(/\s+/).filter(Boolean);
@@ -312,14 +379,47 @@ export async function startBot() {
       } else if (!state) {
         return;
       } else if (query.data === "skip_buttons" || query.data === "done_buttons") {
-        await sendToAllChats(bot, token, state, query.message.chat.id);
-        userStates.delete(userId);
+        await showChatPicker(bot, query.message.chat.id, state);
+
       } else if (query.data === "add_button") {
         state.step = "broadcast_awaiting_button_text";
         await bot.sendMessage(
           query.message.chat.id,
           "Send text for your button (or send /back to go back):"
         );
+
+      } else if (query.data === "cancel_broadcast") {
+        userStates.delete(userId);
+        try {
+          await bot.deleteMessage(query.message.chat.id, query.message.message_id);
+        } catch { }
+        await bot.sendMessage(query.message.chat.id, "Broadcast cancelled.");
+
+      } else if (query.data === "send_selected") {
+        if (!state.selectedChatIds || state.selectedChatIds.size === 0) {
+          await bot.answerCallbackQuery(query.id, { text: "Please select at least one chat first." });
+          return;
+        }
+        try {
+          await bot.deleteMessage(query.message.chat.id, query.message.message_id);
+        } catch { }
+        await sendToSelectedChats(bot, token, state, query.message.chat.id, state.selectedChatIds);
+        userStates.delete(userId);
+
+      } else if (query.data?.startsWith("toggle_")) {
+        if (!state.availableChats || !state.selectedChatIds || !state.selectionMessageId) return;
+        const toggledId = query.data.slice("toggle_".length);
+        if (state.selectedChatIds.has(toggledId)) {
+          state.selectedChatIds.delete(toggledId);
+        } else {
+          state.selectedChatIds.add(toggledId);
+        }
+        try {
+          await bot.editMessageReplyMarkup(
+            { inline_keyboard: buildChatPickerKeyboard(state.availableChats, state.selectedChatIds) },
+            { chat_id: query.message.chat.id, message_id: state.selectionMessageId }
+          );
+        } catch { }
       }
     } catch (err) {
       logger.error({ err }, "Error handling callback_query");
@@ -509,6 +609,48 @@ async function copyMessageViaApi(
   } catch (err) {
     return { ok: false, banned: false, error: String(err) };
   }
+}
+
+async function sendToSelectedChats(
+  bot: TelegramBot,
+  token: string,
+  state: UserState,
+  adminChatId: number,
+  selectedIds: Set<string>
+) {
+  const originalMsg = state.message!;
+  const replyMarkup =
+    state.buttons.length > 0
+      ? { inline_keyboard: state.buttons.map((b) => [{ text: b.text, url: b.url }]) }
+      : undefined;
+
+  let successCount = 0;
+  let failCount = 0;
+  let removedCount = 0;
+
+  for (const chatId of selectedIds) {
+    const result = await copyMessageViaApi(token, chatId, originalMsg.chat.id, originalMsg.message_id, replyMarkup);
+
+    if (result.ok) {
+      successCount++;
+    } else if (result.banned) {
+      removedCount++;
+      logger.warn({ chatId, error: result.error }, "Bot banned — removing from DB");
+      try {
+        await db.delete(connectedChatsTable).where(eq(connectedChatsTable.chatId, BigInt(chatId)));
+      } catch (dbErr) {
+        logger.error({ dbErr }, "Failed to remove banned chat");
+      }
+    } else {
+      failCount++;
+      logger.error({ chatId, error: result.error }, "Failed to send to chat");
+    }
+  }
+
+  const parts: string[] = [`Message sent to ${successCount} chat(s).`];
+  if (removedCount > 0) parts.push(`${removedCount} removed (bot was banned).`);
+  if (failCount > 0) parts.push(`${failCount} failed.`);
+  await bot.sendMessage(adminChatId, parts.join(" "));
 }
 
 async function sendToAllChats(
