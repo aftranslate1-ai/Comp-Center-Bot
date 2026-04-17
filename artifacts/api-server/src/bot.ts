@@ -51,7 +51,7 @@ interface UserState {
 
 const userStates = new Map<number, UserState>();
 
-async function searchMessages(query: string): Promise<Array<{ channelUsername: string; messageId: number; text: string }>> {
+async function searchMessages(query: string): Promise<Array<{ channelUsername: string; messageId: number; text: string; audioTitle: string | null }>> {
   const words = query.trim().split(/\s+/).filter(Boolean);
   if (words.length === 0) return [];
 
@@ -67,6 +67,7 @@ async function searchMessages(query: string): Promise<Array<{ channelUsername: s
     channelUsername: r.channelUsername,
     messageId: r.messageId,
     text: r.messageText,
+    audioTitle: r.audioTitle ?? null,
   }));
 }
 
@@ -98,8 +99,7 @@ export async function startBot() {
 
   bot.on("channel_post", async (msg) => {
     try {
-      const text = msg.text || msg.caption;
-      if (!text || !msg.chat.username) return;
+      if (!msg.chat.username) return;
 
       const username = msg.chat.username.toLowerCase();
       const isSearchChannel = SEARCH_CHANNEL_USERNAMES.some(
@@ -107,11 +107,34 @@ export async function startBot() {
       );
       if (!isSearchChannel) return;
 
+      const audioTitle =
+        msg.audio?.title ||
+        msg.audio?.file_name ||
+        msg.document?.file_name ||
+        msg.video?.file_name ||
+        null;
+
+      const searchableParts: string[] = [];
+      if (msg.text) searchableParts.push(msg.text);
+      if (msg.caption) searchableParts.push(msg.caption);
+      if (msg.audio?.title) searchableParts.push(msg.audio.title);
+      if (msg.audio?.performer) searchableParts.push(msg.audio.performer);
+      if (msg.audio?.file_name) searchableParts.push(msg.audio.file_name);
+      if (msg.document?.file_name) searchableParts.push(msg.document.file_name);
+      if (msg.video?.file_name) searchableParts.push(msg.video.file_name);
+
+      if (searchableParts.length === 0) return;
+
+      const messageText = searchableParts.join(" ");
+
       await db.insert(channelMessagesTable).values({
         channelUsername: msg.chat.username,
         messageId: msg.message_id,
-        messageText: text,
+        messageText,
+        audioTitle,
       }).onConflictDoNothing();
+
+      logger.info({ username, audioTitle, messageId: msg.message_id }, "Indexed channel post");
     } catch (err) {
       logger.error({ err }, "Error indexing channel post");
     }
@@ -340,7 +363,10 @@ export async function startBot() {
             try {
               await bot.forwardMessage(msg.chat.id, `@${result.channelUsername}`, result.messageId);
             } catch {
-              await bot.sendMessage(msg.chat.id, `📄 ${result.text.slice(0, 300)}`);
+              const display = result.audioTitle
+                ? `🎵 ${result.audioTitle}`
+                : `📄 ${result.text.slice(0, 300)}`;
+              await bot.sendMessage(msg.chat.id, display);
             }
           }
         }
