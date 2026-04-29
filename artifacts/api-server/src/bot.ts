@@ -61,6 +61,20 @@ interface UserState {
   selectionMessageId?: number;
   removeFilePage?: number;
   removeFileMessageId?: number;
+  inlineAddedCount?: number;
+}
+
+async function safeSendMessage(
+  bot: TelegramBot,
+  chatId: number,
+  text: string,
+  options?: TelegramBot.SendMessageOptions
+): Promise<void> {
+  try {
+    await bot.sendMessage(chatId, text, options);
+  } catch (err) {
+    logger.warn({ err, chatId }, "safeSendMessage failed (likely rate limited)");
+  }
 }
 
 const userStates = new Map<number, UserState>();
@@ -406,7 +420,7 @@ export async function startBot() {
         await bot.sendMessage(msg.chat.id, "This is not an available command.");
         return;
       }
-      userStates.set(msg.from!.id, { step: "inline_awaiting_audio", buttons: [] });
+      userStates.set(msg.from!.id, { step: "inline_awaiting_audio", buttons: [], inlineAddedCount: 0 });
       await bot.sendMessage(
         msg.chat.id,
         "Send me the song(s) you would like to add to the inline searching 🎵\n\nYou can send as many audio files as you want, one after the other. Send /done when you're finished."
@@ -454,8 +468,13 @@ export async function startBot() {
       if (msg.chat.type !== "private") return;
       const state = userStates.get(msg.from!.id);
       if (state?.step === "inline_awaiting_audio") {
+        const total = state.inlineAddedCount || 0;
         userStates.delete(msg.from!.id);
-        await bot.sendMessage(msg.chat.id, "✅ Done! All sent songs are now searchable inline.");
+        await safeSendMessage(
+          bot,
+          msg.chat.id,
+          `✅ Done! Added ${total} song${total === 1 ? "" : "s"} — all are now searchable inline.`
+        );
       }
     } catch (err) {
       logger.error({ err }, "Error handling /done");
@@ -708,20 +727,21 @@ export async function startBot() {
                 },
               });
 
-            const label = audio.title
-              ? `${audio.performer ? audio.performer + " — " : ""}${audio.title}`
-              : audio.file_name || "song";
-            await bot.sendMessage(
-              msg.chat.id,
-              `✅ Added: ${label}\n\nKeep sending more, or /done when you're finished.`
-            );
+            state.inlineAddedCount = (state.inlineAddedCount || 0) + 1;
+            if (state.inlineAddedCount % 5 === 0) {
+              await safeSendMessage(
+                bot,
+                msg.chat.id,
+                `✅ Added ${state.inlineAddedCount} so far. Keep sending, or /done when finished.`
+              );
+            }
           } catch (err) {
             logger.error({ err }, "Error saving inline audio");
-            await bot.sendMessage(msg.chat.id, "⚠️ Couldn't save that one, please try again.");
           }
           return;
         } else {
-          await bot.sendMessage(
+          await safeSendMessage(
+            bot,
             msg.chat.id,
             "Please send an audio file (a song), or /done when you're finished."
           );
@@ -730,7 +750,7 @@ export async function startBot() {
       }
 
       if (!state) {
-        await bot.sendMessage(msg.chat.id, HELP_TEXT);
+        await safeSendMessage(bot, msg.chat.id, HELP_TEXT);
         return;
       }
 
