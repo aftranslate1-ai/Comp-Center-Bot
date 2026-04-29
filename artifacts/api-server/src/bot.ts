@@ -704,6 +704,7 @@ export async function startBot() {
                   fileName: audio.file_name || null,
                   duration: audio.duration || null,
                   searchText,
+                  addedAt: new Date(),
                 },
               });
 
