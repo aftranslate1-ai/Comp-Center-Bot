@@ -42,7 +42,8 @@ type UserStep =
   | "broadcast_awaiting_button_text"
   | "broadcast_awaiting_button_url"
   | "broadcast_selecting_chats"
-  | "inline_awaiting_audio";
+  | "inline_awaiting_audio"
+  | "removefile_browsing";
 
 interface ConnectedChatOption {
   chatId: string;
@@ -58,6 +59,8 @@ interface UserState {
   availableChats?: ConnectedChatOption[];
   selectedChatIds?: Set<string>;
   selectionMessageId?: number;
+  removeFilePage?: number;
+  removeFileMessageId?: number;
 }
 
 const userStates = new Map<number, UserState>();
@@ -83,6 +86,47 @@ function buildChatPickerKeyboard(
   ]);
 
   return rows;
+}
+
+const REMOVE_PAGE_SIZE = 10;
+
+function formatSongLabel(row: { title: string | null; performer: string | null; fileName: string | null }): string {
+  if (row.title) {
+    return row.performer ? `${row.performer} — ${row.title}` : row.title;
+  }
+  return row.fileName || "Untitled";
+}
+
+async function buildRemoveFileKeyboard(
+  page: number
+): Promise<{ keyboard: TelegramBot.InlineKeyboardButton[][]; total: number; pageCount: number }> {
+  const totalRows = await db.select().from(inlineAudioFilesTable);
+  const total = totalRows.length;
+  const pageCount = Math.max(1, Math.ceil(total / REMOVE_PAGE_SIZE));
+  const safePage = Math.min(Math.max(0, page), pageCount - 1);
+
+  const offset = safePage * REMOVE_PAGE_SIZE;
+  const sorted = totalRows
+    .slice()
+    .sort((a, b) => b.addedAt.getTime() - a.addedAt.getTime())
+    .slice(offset, offset + REMOVE_PAGE_SIZE);
+
+  const rows: TelegramBot.InlineKeyboardButton[][] = sorted.map((r) => [
+    {
+      text: `❌ ${formatSongLabel(r)}`.slice(0, 60),
+      callback_data: `rm_${r.id}`,
+    },
+  ]);
+
+  const navRow: TelegramBot.InlineKeyboardButton[] = [];
+  if (safePage > 0) navRow.push({ text: "⬅️ Prev", callback_data: `rm_page_${safePage - 1}` });
+  navRow.push({ text: `Page ${safePage + 1}/${pageCount}`, callback_data: "rm_noop" });
+  if (safePage < pageCount - 1) navRow.push({ text: "Next ➡️", callback_data: `rm_page_${safePage + 1}` });
+  rows.push(navRow);
+
+  rows.push([{ text: "Done ✅", callback_data: "rm_done" }]);
+
+  return { keyboard: rows, total, pageCount };
 }
 
 async function showChatPicker(
@@ -372,6 +416,39 @@ export async function startBot() {
     }
   });
 
+  bot.onText(/\/removefile/, async (msg) => {
+    try {
+      if (msg.chat.type !== "private") return;
+      const username = msg.from?.username;
+      if (username !== AUTHORIZED_USERNAME) {
+        await bot.sendMessage(msg.chat.id, "This is not an available command.");
+        return;
+      }
+
+      const { keyboard, total } = await buildRemoveFileKeyboard(0);
+
+      if (total === 0) {
+        await bot.sendMessage(msg.chat.id, "There are no songs to remove yet.");
+        return;
+      }
+
+      const sent = await bot.sendMessage(
+        msg.chat.id,
+        `🗑️ Tap a song to remove it from inline search.\n\n${total} song(s) total.`,
+        { reply_markup: { inline_keyboard: keyboard } }
+      );
+
+      userStates.set(msg.from!.id, {
+        step: "removefile_browsing",
+        buttons: [],
+        removeFilePage: 0,
+        removeFileMessageId: sent.message_id,
+      });
+    } catch (err) {
+      logger.error({ err }, "Error handling /removefile");
+    }
+  });
+
   bot.onText(/\/done/, async (msg) => {
     try {
       if (msg.chat.type !== "private") return;
@@ -482,6 +559,83 @@ export async function startBot() {
         await sendToSelectedChats(bot, token, state, query.message.chat.id, state.selectedChatIds);
         userStates.delete(userId);
 
+      } else if (query.data === "rm_noop") {
+        return;
+
+      } else if (query.data === "rm_done") {
+        userStates.delete(userId);
+        try {
+          await bot.editMessageText("✅ Done.", {
+            chat_id: query.message.chat.id,
+            message_id: query.message.message_id,
+          });
+        } catch { }
+
+      } else if (query.data?.startsWith("rm_page_")) {
+        const newPage = parseInt(query.data.slice("rm_page_".length), 10);
+        if (Number.isNaN(newPage)) return;
+        const { keyboard, total } = await buildRemoveFileKeyboard(newPage);
+        if (state.step !== "removefile_browsing") return;
+        state.removeFilePage = newPage;
+        try {
+          await bot.editMessageText(
+            `🗑️ Tap a song to remove it from inline search.\n\n${total} song(s) total.`,
+            {
+              chat_id: query.message.chat.id,
+              message_id: query.message.message_id,
+              reply_markup: { inline_keyboard: keyboard },
+            }
+          );
+        } catch { }
+
+      } else if (query.data?.startsWith("rm_") && query.data !== "rm_done") {
+        const id = parseInt(query.data.slice("rm_".length), 10);
+        if (Number.isNaN(id)) return;
+        if (state.step !== "removefile_browsing") return;
+
+        const existing = await db
+          .select()
+          .from(inlineAudioFilesTable)
+          .where(eq(inlineAudioFilesTable.id, id))
+          .limit(1);
+
+        if (existing.length === 0) {
+          await bot.answerCallbackQuery(query.id, { text: "Already removed." });
+        } else {
+          await db.delete(inlineAudioFilesTable).where(eq(inlineAudioFilesTable.id, id));
+          await bot.answerCallbackQuery(query.id, {
+            text: `Removed: ${formatSongLabel(existing[0]!)}`,
+          });
+        }
+
+        const currentPage = state.removeFilePage ?? 0;
+        const { keyboard, total, pageCount } = await buildRemoveFileKeyboard(currentPage);
+
+        if (total === 0) {
+          userStates.delete(userId);
+          try {
+            await bot.editMessageText("✅ All songs removed.", {
+              chat_id: query.message.chat.id,
+              message_id: query.message.message_id,
+            });
+          } catch { }
+          return;
+        }
+
+        const safePage = Math.min(currentPage, pageCount - 1);
+        state.removeFilePage = safePage;
+
+        try {
+          await bot.editMessageText(
+            `🗑️ Tap a song to remove it from inline search.\n\n${total} song(s) total.`,
+            {
+              chat_id: query.message.chat.id,
+              message_id: query.message.message_id,
+              reply_markup: { inline_keyboard: keyboard },
+            }
+          );
+        } catch { }
+
       } else if (query.data?.startsWith("toggle_")) {
         if (!state.availableChats || !state.selectedChatIds || !state.selectionMessageId) return;
         const toggledId = query.data.slice("toggle_".length);
@@ -511,6 +665,7 @@ export async function startBot() {
         msg.text?.startsWith("/feedback") ||
         msg.text?.startsWith("/publicforward") ||
         msg.text?.startsWith("/publicfile") ||
+        msg.text?.startsWith("/removefile") ||
         msg.text?.startsWith("/done")
       ) return;
 
