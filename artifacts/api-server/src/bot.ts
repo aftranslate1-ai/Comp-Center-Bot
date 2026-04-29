@@ -1,8 +1,9 @@
 import TelegramBot from "node-telegram-bot-api";
 import { db } from "@workspace/db";
-import { connectedChatsTable, channelMessagesTable } from "@workspace/db/schema";
+import { connectedChatsTable, channelMessagesTable, inlineAudioFilesTable } from "@workspace/db/schema";
 import { logger } from "./lib/logger";
-import { eq, ilike, or, isNotNull, and } from "drizzle-orm";
+import { eq, ilike, or, isNotNull, and, desc } from "drizzle-orm";
+import crypto from "crypto";
 
 const AUTHORIZED_USERNAME = "BeRichAsFreh";
 
@@ -40,7 +41,8 @@ type UserStep =
   | "broadcast_awaiting_button_choice"
   | "broadcast_awaiting_button_text"
   | "broadcast_awaiting_button_url"
-  | "broadcast_selecting_chats";
+  | "broadcast_selecting_chats"
+  | "inline_awaiting_audio";
 
 interface ConnectedChatOption {
   chatId: string;
@@ -274,6 +276,48 @@ export async function startBot() {
     }
   });
 
+  bot.on("inline_query", async (query) => {
+    try {
+      const q = (query.query || "").trim();
+
+      let rows;
+      if (q.length === 0) {
+        rows = await db
+          .select()
+          .from(inlineAudioFilesTable)
+          .orderBy(desc(inlineAudioFilesTable.addedAt))
+          .limit(50);
+      } else {
+        const words = q.split(/\s+/).filter(Boolean);
+        const conditions = words.map((w) =>
+          ilike(inlineAudioFilesTable.searchText, `%${w}%`)
+        );
+        rows = await db
+          .select()
+          .from(inlineAudioFilesTable)
+          .where(and(...conditions))
+          .orderBy(desc(inlineAudioFilesTable.addedAt))
+          .limit(50);
+      }
+
+      const results = rows.map((r) => ({
+        type: "audio" as const,
+        id: crypto.createHash("md5").update(r.fileUniqueId).digest("hex").slice(0, 32),
+        audio_file_id: r.fileId,
+      }));
+
+      await bot.answerInlineQuery(query.id, results, {
+        cache_time: 0,
+        is_personal: false,
+      });
+    } catch (err) {
+      logger.error({ err }, "Error handling inline_query");
+      try {
+        await bot.answerInlineQuery(query.id, [], { cache_time: 0 });
+      } catch { }
+    }
+  });
+
   bot.onText(/\/start/, async (msg) => {
     try {
       if (msg.chat.type !== "private") return;
@@ -307,6 +351,37 @@ export async function startBot() {
       );
     } catch (err) {
       logger.error({ err }, "Error handling /feedback");
+    }
+  });
+
+  bot.onText(/\/publicfile/, async (msg) => {
+    try {
+      if (msg.chat.type !== "private") return;
+      const username = msg.from?.username;
+      if (username !== AUTHORIZED_USERNAME) {
+        await bot.sendMessage(msg.chat.id, "This is not an available command.");
+        return;
+      }
+      userStates.set(msg.from!.id, { step: "inline_awaiting_audio", buttons: [] });
+      await bot.sendMessage(
+        msg.chat.id,
+        "Send me the song(s) you would like to add to the inline searching 🎵\n\nYou can send as many audio files as you want, one after the other. Send /done when you're finished."
+      );
+    } catch (err) {
+      logger.error({ err }, "Error handling /publicfile");
+    }
+  });
+
+  bot.onText(/\/done/, async (msg) => {
+    try {
+      if (msg.chat.type !== "private") return;
+      const state = userStates.get(msg.from!.id);
+      if (state?.step === "inline_awaiting_audio") {
+        userStates.delete(msg.from!.id);
+        await bot.sendMessage(msg.chat.id, "✅ Done! All sent songs are now searchable inline.");
+      }
+    } catch (err) {
+      logger.error({ err }, "Error handling /done");
     }
   });
 
@@ -434,11 +509,69 @@ export async function startBot() {
         msg.text?.startsWith("/start") ||
         msg.text?.startsWith("/search") ||
         msg.text?.startsWith("/feedback") ||
-        msg.text?.startsWith("/publicforward")
+        msg.text?.startsWith("/publicforward") ||
+        msg.text?.startsWith("/publicfile") ||
+        msg.text?.startsWith("/done")
       ) return;
 
       const userId = msg.from.id;
       const state = userStates.get(userId);
+
+      if (state?.step === "inline_awaiting_audio") {
+        if (msg.audio) {
+          const audio = msg.audio;
+          const searchParts = [
+            audio.title,
+            audio.performer,
+            audio.file_name,
+            msg.caption,
+          ].filter(Boolean) as string[];
+          const searchText = searchParts.join(" ");
+
+          try {
+            await db
+              .insert(inlineAudioFilesTable)
+              .values({
+                fileUniqueId: audio.file_unique_id,
+                fileId: audio.file_id,
+                title: audio.title || null,
+                performer: audio.performer || null,
+                fileName: audio.file_name || null,
+                duration: audio.duration || null,
+                searchText,
+              })
+              .onConflictDoUpdate({
+                target: inlineAudioFilesTable.fileUniqueId,
+                set: {
+                  fileId: audio.file_id,
+                  title: audio.title || null,
+                  performer: audio.performer || null,
+                  fileName: audio.file_name || null,
+                  duration: audio.duration || null,
+                  searchText,
+                },
+              });
+
+            const label = audio.title
+              ? `${audio.performer ? audio.performer + " — " : ""}${audio.title}`
+              : audio.file_name || "song";
+            await bot.sendMessage(
+              msg.chat.id,
+              `✅ Added: ${label}\n\nKeep sending more, or /done when you're finished.`
+            );
+          } catch (err) {
+            logger.error({ err }, "Error saving inline audio");
+            await bot.sendMessage(msg.chat.id, "⚠️ Couldn't save that one, please try again.");
+          }
+          return;
+        } else {
+          await bot.sendMessage(
+            msg.chat.id,
+            "Please send an audio file (a song), or /done when you're finished."
+          );
+          return;
+        }
+      }
 
       if (!state) {
         await bot.sendMessage(msg.chat.id, HELP_TEXT);
