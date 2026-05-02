@@ -63,6 +63,12 @@ interface TagFile {
   duration?: number;
 }
 
+interface FileForwardPair {
+  normal: TagFile;
+  caption?: string;
+  og?: TagFile;
+}
+
 type UserStep =
   | "search_awaiting_query"
   | "feedback_awaiting_text"
@@ -86,7 +92,7 @@ type UserStep =
   | "freepremium_remove_awaiting_user"
   | "freepremium_give_confirm"
   | "earlymusic_collecting"
-  | "fileforward_awaiting_normal"
+  | "fileforward_collecting"
   | "fileforward_awaiting_og"
   | "fileforward_selecting_chats";
 
@@ -122,9 +128,8 @@ interface UserState {
   earlyMusicFiles?: TagFile[];
   earlyMusicAddedCount?: number;
   // fileforward
-  fileforwardNormalFile?: TagFile;
-  fileforwardOgFile?: TagFile;
-  fileforwardCaption?: string;
+  fileforwardFiles?: FileForwardPair[];
+  fileforwardCurrentOgIndex?: number;
 }
 
 const userStates = new Map<number, UserState>();
@@ -809,10 +814,14 @@ export async function startBot() {
         await bot.sendMessage(msg.chat.id, "This is not an available command.");
         return;
       }
-      userStates.set(msg.from!.id, { step: "fileforward_awaiting_normal", buttons: [] });
+      userStates.set(msg.from!.id, {
+        step: "fileforward_collecting",
+        buttons: [],
+        fileforwardFiles: [],
+      });
       await bot.sendMessage(
         msg.chat.id,
-        "Send me the normal (compressed) audio file first."
+        "Send me all the files you want to forward, one after the other. You can include a caption on each file. Send /done when you've sent them all."
       );
     } catch (err) {
       logger.error({ err }, "Error handling /fileforward");
@@ -913,6 +922,22 @@ export async function startBot() {
         await bot.sendMessage(
           msg.chat.id,
           `Got ${state.tagFiles.length} file${state.tagFiles.length === 1 ? "" : "s"}! Now send me the cover art (send a photo).`
+        );
+
+      } else if (state.step === "fileforward_collecting") {
+        const files = state.fileforwardFiles || [];
+        if (files.length === 0) {
+          userStates.delete(userId);
+          await bot.sendMessage(msg.chat.id, "No files were sent. Cancelled.");
+          return;
+        }
+        state.fileforwardCurrentOgIndex = 0;
+        state.step = "fileforward_awaiting_og";
+        const first = files[0]!;
+        const label = first.normal.title || first.normal.fileName || `File 1`;
+        await bot.sendMessage(
+          msg.chat.id,
+          `Got ${files.length} file${files.length === 1 ? "" : "s"}! Now send me the OG file for:\n\n"${label}" (1/${files.length})`
         );
 
       } else if (state.step === "earlymusic_collecting") {
@@ -1310,21 +1335,22 @@ export async function startBot() {
 
       // ── File forward collection ──────────────────────────────────────────────
 
-      if (state?.step === "fileforward_awaiting_normal") {
+      if (state?.step === "fileforward_collecting") {
         if (!msg.audio) {
-          await safeSendMessage(bot, msg.chat.id, "Please send an audio file.");
+          await safeSendMessage(bot, msg.chat.id, "Please send audio files, or /done when finished.");
           return;
         }
-        state.fileforwardNormalFile = {
-          fileId: msg.audio.file_id,
-          fileUniqueId: msg.audio.file_unique_id,
-          title: msg.audio.title,
-          performer: msg.audio.performer,
-          fileName: msg.audio.file_name,
-        };
-        state.fileforwardCaption = msg.caption || undefined;
-        state.step = "fileforward_awaiting_og";
-        await bot.sendMessage(msg.chat.id, "Got it! Now send me the OG (original quality) file.");
+        state.fileforwardFiles = state.fileforwardFiles || [];
+        state.fileforwardFiles.push({
+          normal: {
+            fileId: msg.audio.file_id,
+            fileUniqueId: msg.audio.file_unique_id,
+            title: msg.audio.title,
+            performer: msg.audio.performer,
+            fileName: msg.audio.file_name,
+          },
+          caption: msg.caption || undefined,
+        });
         return;
       }
 
@@ -1333,14 +1359,27 @@ export async function startBot() {
           await safeSendMessage(bot, msg.chat.id, "Please send an audio file for the OG version.");
           return;
         }
-        state.fileforwardOgFile = {
+        const files = state.fileforwardFiles!;
+        const idx = state.fileforwardCurrentOgIndex!;
+        files[idx]!.og = {
           fileId: msg.audio.file_id,
           fileUniqueId: msg.audio.file_unique_id,
           title: msg.audio.title,
           performer: msg.audio.performer,
           fileName: msg.audio.file_name,
         };
-        await showChatPicker(bot, msg.chat.id, state, "fileforward_selecting_chats");
+        const nextIdx = idx + 1;
+        if (nextIdx < files.length) {
+          state.fileforwardCurrentOgIndex = nextIdx;
+          const next = files[nextIdx]!;
+          const label = next.normal.title || next.normal.fileName || `File ${nextIdx + 1}`;
+          await bot.sendMessage(
+            msg.chat.id,
+            `Got it! Now send me the OG file for:\n\n"${label}" (${nextIdx + 1}/${files.length})`
+          );
+        } else {
+          await showChatPicker(bot, msg.chat.id, state, "fileforward_selecting_chats");
+        }
         return;
       }
 
@@ -2150,96 +2189,107 @@ async function sendFileForwardToChats(
   adminChatId: number,
   selectedIds: Set<string>
 ) {
-  const normalFile = state.fileforwardNormalFile!;
-  const ogFile = state.fileforwardOgFile!;
+  const pairs = state.fileforwardFiles!;
 
-  // Save normal file (linked to OG) and OG file separately
-  try {
-    await db
-      .insert(botFilesTable)
-      .values({
-        fileUniqueId: normalFile.fileUniqueId,
-        fileId: normalFile.fileId,
-        title: normalFile.title || null,
-        performer: normalFile.performer || null,
-        fileName: normalFile.fileName || null,
-        ogFileUniqueId: ogFile.fileUniqueId,
-        ogFileId: ogFile.fileId,
-      })
-      .onConflictDoUpdate({
-        target: botFilesTable.fileUniqueId,
-        set: { fileId: normalFile.fileId, ogFileUniqueId: ogFile.fileUniqueId, ogFileId: ogFile.fileId },
-      });
-
-    await db
-      .insert(botFilesTable)
-      .values({
-        fileUniqueId: ogFile.fileUniqueId,
-        fileId: ogFile.fileId,
-        title: ogFile.title || null,
-        performer: ogFile.performer || null,
-        fileName: ogFile.fileName || null,
-      })
-      .onConflictDoUpdate({ target: botFilesTable.fileUniqueId, set: { fileId: ogFile.fileId } });
-  } catch (err) {
-    logger.error({ err }, "Failed to save fileforward files to botFiles");
-  }
-
-  // Channels only get one "Download" button — OG offer happens in DM after download
-  const replyMarkup = {
-    inline_keyboard: [
-      [
-        {
-          text: "Download",
-          url: `https://t.me/${BOT_USERNAME}?start=get_${normalFile.fileUniqueId}`,
-        },
-      ],
-    ],
-  };
-
-  let successCount = 0;
-  let failCount = 0;
-  let removedCount = 0;
-
-  for (const chatId of selectedIds) {
-    // Send the normal file as the visible message, with both download buttons
+  // Save all files to botFiles first
+  for (const pair of pairs) {
     try {
-      const res = await fetch(`https://api.telegram.org/bot${token}/sendAudio`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          audio: normalFile.fileId,
-          caption: state.fileforwardCaption || undefined,
-          reply_markup: replyMarkup,
-        }),
-      });
+      await db
+        .insert(botFilesTable)
+        .values({
+          fileUniqueId: pair.normal.fileUniqueId,
+          fileId: pair.normal.fileId,
+          title: pair.normal.title || null,
+          performer: pair.normal.performer || null,
+          fileName: pair.normal.fileName || null,
+          ogFileUniqueId: pair.og?.fileUniqueId || null,
+          ogFileId: pair.og?.fileId || null,
+        })
+        .onConflictDoUpdate({
+          target: botFilesTable.fileUniqueId,
+          set: {
+            fileId: pair.normal.fileId,
+            ogFileUniqueId: pair.og?.fileUniqueId || null,
+            ogFileId: pair.og?.fileId || null,
+          },
+        });
 
-      if (res.ok) {
-        successCount++;
-      } else {
-        const text = await res.text();
-        if (isBanError(res.status, text)) {
-          removedCount++;
-          logger.warn({ chatId, error: text }, "Bot banned during fileforward — removing from DB");
-          try {
-            await db.delete(connectedChatsTable).where(eq(connectedChatsTable.chatId, BigInt(chatId)));
-          } catch (dbErr) {
-            logger.error({ dbErr }, "Failed to remove banned chat");
-          }
-        } else {
-          failCount++;
-          logger.error({ chatId, error: `${res.status} ${text}` }, "Failed to fileforward to chat");
-        }
+      if (pair.og) {
+        await db
+          .insert(botFilesTable)
+          .values({
+            fileUniqueId: pair.og.fileUniqueId,
+            fileId: pair.og.fileId,
+            title: pair.og.title || null,
+            performer: pair.og.performer || null,
+            fileName: pair.og.fileName || null,
+          })
+          .onConflictDoUpdate({ target: botFilesTable.fileUniqueId, set: { fileId: pair.og.fileId } });
       }
     } catch (err) {
-      failCount++;
-      logger.error({ err, chatId }, "Exception during fileforward send");
+      logger.error({ err }, "Failed to save fileforward file to botFiles");
     }
   }
 
-  const parts: string[] = [`File sent to ${successCount} chat(s).`];
-  if (removedCount > 0) parts.push(`${removedCount} removed (bot was banned).`);
+  let successCount = 0;
+  let failCount = 0;
+  const removedChatIds = new Set<string>();
+
+  for (const chatId of selectedIds) {
+    for (const pair of pairs) {
+      if (removedChatIds.has(chatId)) break;
+
+      const replyMarkup = {
+        inline_keyboard: [[
+          {
+            text: "Download",
+            url: `https://t.me/${BOT_USERNAME}?start=get_${pair.normal.fileUniqueId}`,
+          },
+        ]],
+      };
+
+      try {
+        const res = await fetch(`https://api.telegram.org/bot${token}/sendAudio`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: chatId,
+            audio: pair.normal.fileId,
+            caption: pair.caption || undefined,
+            reply_markup: replyMarkup,
+          }),
+        });
+
+        if (res.ok) {
+          successCount++;
+        } else {
+          const text = await res.text();
+          if (isBanError(res.status, text)) {
+            removedChatIds.add(chatId);
+            logger.warn({ chatId, error: text }, "Bot banned during fileforward — removing from DB");
+            try {
+              await db.delete(connectedChatsTable).where(eq(connectedChatsTable.chatId, BigInt(chatId)));
+            } catch (dbErr) {
+              logger.error({ dbErr }, "Failed to remove banned chat");
+            }
+          } else {
+            failCount++;
+            logger.error({ chatId, error: `${res.status} ${text}` }, "Failed to fileforward to chat");
+          }
+        }
+      } catch (err) {
+        failCount++;
+        logger.error({ err, chatId }, "Exception during fileforward send");
+      }
+
+      // Small delay between sends to avoid rate limits
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  }
+
+  const totalSent = successCount;
+  const parts: string[] = [`${pairs.length} file${pairs.length === 1 ? "" : "s"} sent to ${selectedIds.size - removedChatIds.size} chat${selectedIds.size - removedChatIds.size === 1 ? "" : "s"} (${totalSent} total sends).`];
+  if (removedChatIds.size > 0) parts.push(`${removedChatIds.size} removed (bot was banned).`);
   if (failCount > 0) parts.push(`${failCount} failed.`);
   await bot.sendMessage(adminChatId, parts.join(" "));
 }
