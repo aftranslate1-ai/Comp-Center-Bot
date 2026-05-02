@@ -7,6 +7,8 @@ export const botFilesTable = pgTable("bot_files", {
   title: text("title"),
   performer: text("performer"),
   fileName: text("file_name"),
+  ogFileUniqueId: text("og_file_unique_id"),
+  ogFileId: text("og_file_id"),
   addedAt: timestamp("added_at").defaultNow().notNull(),
 });
 

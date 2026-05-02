@@ -569,7 +569,38 @@ export async function startBot() {
           return;
         }
 
-        await bot.sendAudio(msg.chat.id, rows[0]!.fileId);
+        const file = rows[0]!;
+        await bot.sendAudio(msg.chat.id, file.fileId);
+
+        // If there's an OG version, offer it as a follow-up
+        if (file.ogFileUniqueId) {
+          const premium = await isUserPremium(userId);
+          if (premium) {
+            await bot.sendMessage(msg.chat.id, "Want the OG version?", {
+              reply_markup: {
+                inline_keyboard: [[
+                  {
+                    text: "Download OG",
+                    url: `https://t.me/${BOT_USERNAME}?start=getog_${file.ogFileUniqueId}`,
+                  },
+                ]],
+              },
+            });
+          } else {
+            await bot.sendMessage(
+              msg.chat.id,
+              "Want the OG version? It's available for CC Premium members.",
+              {
+                reply_markup: {
+                  inline_keyboard: [[
+                    { text: "Cancel ❌", callback_data: "cancel_subscribe" },
+                    { text: "Unlock ✨", callback_data: "do_subscribe" },
+                  ]],
+                },
+              }
+            );
+          }
+        }
         return;
       }
 
@@ -2120,7 +2151,7 @@ async function sendFileForwardToChats(
   const normalFile = state.fileforwardNormalFile!;
   const ogFile = state.fileforwardOgFile!;
 
-  // Save both files to botFiles for deep-link retrieval
+  // Save normal file (linked to OG) and OG file separately
   try {
     await db
       .insert(botFilesTable)
@@ -2130,8 +2161,13 @@ async function sendFileForwardToChats(
         title: normalFile.title || null,
         performer: normalFile.performer || null,
         fileName: normalFile.fileName || null,
+        ogFileUniqueId: ogFile.fileUniqueId,
+        ogFileId: ogFile.fileId,
       })
-      .onConflictDoUpdate({ target: botFilesTable.fileUniqueId, set: { fileId: normalFile.fileId } });
+      .onConflictDoUpdate({
+        target: botFilesTable.fileUniqueId,
+        set: { fileId: normalFile.fileId, ogFileUniqueId: ogFile.fileUniqueId, ogFileId: ogFile.fileId },
+      });
 
     await db
       .insert(botFilesTable)
@@ -2147,16 +2183,13 @@ async function sendFileForwardToChats(
     logger.error({ err }, "Failed to save fileforward files to botFiles");
   }
 
+  // Channels only get one "Download" button — OG offer happens in DM after download
   const replyMarkup = {
     inline_keyboard: [
       [
         {
           text: "Download",
           url: `https://t.me/${BOT_USERNAME}?start=get_${normalFile.fileUniqueId}`,
-        },
-        {
-          text: "Download OG",
-          url: `https://t.me/${BOT_USERNAME}?start=getog_${ogFile.fileUniqueId}`,
         },
       ],
     ],
