@@ -672,7 +672,7 @@ export async function startBot() {
 
       await bot.sendMessage(
         msg.chat.id,
-        `Ok, let's get tagging! Would you like to use\n\n• Normal mode - send me a file, choose cover art, title and artist name\n• Fast mode - send me many files, choose cover art and artist name, the song titles for the files will be what it already is or the file name${limitNote}`,
+        `Ok, let's get tagging! Would you like to use\n\n• Normal mode - send me as many files as you want one by one, and for each file I'll ask you for the title, artist, and cover art individually. Send /done when finished.\n• Fast mode - send me many files at once, then choose one cover art and artist name that applies to all of them (titles come from the file itself)${limitNote}`,
         {
           parse_mode: "Markdown",
           reply_markup: {
@@ -813,7 +813,11 @@ export async function startBot() {
       const state = userStates.get(userId);
       if (!state) return;
 
-      if (state.step === "inline_awaiting_audio") {
+      if (state.step === "tagmp3_awaiting_file_normal") {
+        userStates.delete(userId);
+        await safeSendMessage(bot, msg.chat.id, "All done! Your files have been tagged.");
+
+      } else if (state.step === "inline_awaiting_audio") {
         const total = state.inlineAddedCount || 0;
         userStates.delete(userId);
         await safeSendMessage(
