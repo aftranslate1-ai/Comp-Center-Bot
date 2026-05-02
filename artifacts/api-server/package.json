@@ -18,6 +18,7 @@
     "cors": "^2",
     "drizzle-orm": "catalog:",
     "express": "^5",
+    "node-id3": "^0.2.9",
     "node-telegram-bot-api": "^0.67.0",
     "pino": "^9",
     "pino-http": "^10"
