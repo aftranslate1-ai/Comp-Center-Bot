@@ -1517,18 +1517,19 @@ export async function startBot() {
       }
 
       if (state?.step === "earlymusic_awaiting_flac") {
-        if (!msg.audio) {
-          await safeSendMessage(bot, msg.chat.id, "Please send an audio file for the FLAC version.");
+        const flacFile = msg.audio || msg.document;
+        if (!flacFile) {
+          await safeSendMessage(bot, msg.chat.id, "Please send the FLAC file (audio or document).");
           return;
         }
         const files = state.earlyMusicFiles!;
         const idx = state.earlyMusicCurrentFlacIndex!;
         files[idx]!.flac = {
-          fileId: msg.audio.file_id,
-          fileUniqueId: msg.audio.file_unique_id,
-          title: msg.audio.title,
-          performer: msg.audio.performer,
-          fileName: msg.audio.file_name,
+          fileId: flacFile.file_id,
+          fileUniqueId: flacFile.file_unique_id,
+          title: msg.audio?.title,
+          performer: msg.audio?.performer,
+          fileName: (msg.audio as any)?.file_name || (msg.document as any)?.file_name,
         };
         const nextIdx = idx + 1;
         if (nextIdx < files.length) {
