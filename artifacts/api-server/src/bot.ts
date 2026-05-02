@@ -337,7 +337,8 @@ async function buildRemoveFileKeyboard(page: number): Promise<{
 async function showChatPicker(
   bot: TelegramBot,
   chatId: number,
-  state: UserState
+  state: UserState,
+  step: UserStep = "broadcast_selecting_chats"
 ): Promise<void> {
   const chats = await db.select().from(connectedChatsTable);
   if (chats.length === 0) {
@@ -353,7 +354,7 @@ async function showChatPicker(
 
   state.availableChats = options;
   state.selectedChatIds = new Set();
-  state.step = "broadcast_selecting_chats";
+  state.step = step;
 
   const sentMsg = await bot.sendMessage(
     chatId,
@@ -1306,8 +1307,7 @@ export async function startBot() {
           performer: msg.audio.performer,
           fileName: msg.audio.file_name,
         };
-        state.step = "fileforward_selecting_chats";
-        await showChatPicker(bot, chatId, state);
+        await showChatPicker(bot, msg.chat.id, state, "fileforward_selecting_chats");
         return;
       }
 
@@ -2151,11 +2151,11 @@ async function sendFileForwardToChats(
     inline_keyboard: [
       [
         {
-          text: "Download ⬇️",
+          text: "Download",
           url: `https://t.me/${BOT_USERNAME}?start=get_${normalFile.fileUniqueId}`,
         },
         {
-          text: "Download OG ⬇️ ✨",
+          text: "Download OG",
           url: `https://t.me/${BOT_USERNAME}?start=getog_${ogFile.fileUniqueId}`,
         },
       ],
