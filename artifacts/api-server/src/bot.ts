@@ -69,6 +69,12 @@ interface FileForwardPair {
   og?: TagFile;
 }
 
+interface EarlyMusicPair {
+  normal: TagFile;
+  caption?: string;
+  wav?: TagFile;
+}
+
 type UserStep =
   | "search_awaiting_query"
   | "feedback_awaiting_text"
@@ -92,6 +98,7 @@ type UserStep =
   | "freepremium_remove_awaiting_user"
   | "freepremium_give_confirm"
   | "earlymusic_collecting"
+  | "earlymusic_awaiting_wav"
   | "fileforward_collecting"
   | "fileforward_awaiting_og"
   | "fileforward_selecting_chats";
@@ -125,8 +132,9 @@ interface UserState {
   freepremiumTargetUsername?: string;
   freepremiumAction?: "give" | "remove";
   // earlymusic
-  earlyMusicFiles?: TagFile[];
+  earlyMusicFiles?: EarlyMusicPair[];
   earlyMusicAddedCount?: number;
+  earlyMusicCurrentWavIndex?: number;
   // fileforward
   fileforwardFiles?: FileForwardPair[];
   fileforwardCurrentOgIndex?: number;
@@ -531,6 +539,35 @@ export async function startBot() {
 
       const payload = (match?.[1] || "").trim();
 
+      if (payload.startsWith("getwav_")) {
+        // WAV file — premium required
+        const fileUniqueId = payload.slice(7);
+        const premium = await isUserPremium(userId);
+
+        if (!premium) {
+          await sendPremiumPaywall(
+            bot,
+            msg.chat.id,
+            "Downloading WAV files is a CC Premium feature."
+          );
+          return;
+        }
+
+        const rows = await db
+          .select()
+          .from(botFilesTable)
+          .where(eq(botFilesTable.fileUniqueId, fileUniqueId))
+          .limit(1);
+
+        if (rows.length === 0 || !rows[0]!.wavFileId) {
+          await bot.sendMessage(msg.chat.id, "Sorry, I couldn't find that WAV file.");
+          return;
+        }
+
+        await bot.sendAudio(msg.chat.id, rows[0]!.wavFileId);
+        return;
+      }
+
       if (payload.startsWith("getog_")) {
         // OG file — premium required
         const fileUniqueId = payload.slice(6);
@@ -915,17 +952,34 @@ export async function startBot() {
           await bot.sendMessage(msg.chat.id, "No files were sent. Cancelled.");
           return;
         }
-        state.fileforwardCurrentOgIndex = 0;
-        state.step = "fileforward_awaiting_og";
+        await bot.sendMessage(
+          msg.chat.id,
+          `Got ${files.length} file${files.length === 1 ? "" : "s"}! Would you like to include OG files?`,
+          {
+            reply_markup: {
+              inline_keyboard: [[
+                { text: "Yes", callback_data: "fileforward_include_og" },
+                { text: "Skip", callback_data: "fileforward_skip_og" },
+              ]],
+            },
+          }
+        );
+
+      } else if (state.step === "earlymusic_collecting") {
+        const files = state.earlyMusicFiles || [];
+        if (files.length === 0) {
+          userStates.delete(userId);
+          await bot.sendMessage(msg.chat.id, "No files were sent. Cancelled.");
+          return;
+        }
+        state.earlyMusicCurrentWavIndex = 0;
+        state.step = "earlymusic_awaiting_wav";
         const first = files[0]!;
         const label = first.normal.title || first.normal.fileName || `File 1`;
         await bot.sendMessage(
           msg.chat.id,
-          `Got ${files.length} file${files.length === 1 ? "" : "s"}! Now send me the OG file for:\n\n"${label}" (1/${files.length})`
+          `Got ${files.length} file${files.length === 1 ? "" : "s"}! Now send me the WAV file for:\n\n"${label}" (1/${files.length})`
         );
-
-      } else if (state.step === "earlymusic_collecting") {
-        await broadcastEarlyMusic(bot, token, msg.chat.id, userId, state);
       }
     } catch (err) {
       logger.error({ err }, "Error handling /done");
@@ -1009,6 +1063,26 @@ export async function startBot() {
             ? "Early music access disabled. You won't receive early songs."
             : "Early music access enabled! You'll now receive new songs before they're publicly posted 🎵"
         );
+        return;
+
+      } else if (query.data === "fileforward_include_og") {
+        if (!state || state.step !== "fileforward_collecting") return;
+        try { await bot.deleteMessage(chatId, msgId); } catch { }
+        const files = state.fileforwardFiles!;
+        state.fileforwardCurrentOgIndex = 0;
+        state.step = "fileforward_awaiting_og";
+        const first = files[0]!;
+        const label = first.normal.title || first.normal.fileName || `File 1`;
+        await bot.sendMessage(
+          chatId,
+          `Send me the OG file for:\n\n"${label}" (1/${files.length})`
+        );
+        return;
+
+      } else if (query.data === "fileforward_skip_og") {
+        if (!state || state.step !== "fileforward_collecting") return;
+        try { await bot.deleteMessage(chatId, msgId); } catch { }
+        await showChatPicker(bot, chatId, state, "fileforward_selecting_chats");
         return;
       }
 
@@ -1423,18 +1497,50 @@ export async function startBot() {
           const audio = msg.audio;
           state.earlyMusicFiles = state.earlyMusicFiles || [];
           state.earlyMusicFiles.push({
-            fileId: audio.file_id,
-            fileUniqueId: audio.file_unique_id,
-            title: audio.title,
-            performer: audio.performer,
-            fileName: audio.file_name,
+            normal: {
+              fileId: audio.file_id,
+              fileUniqueId: audio.file_unique_id,
+              title: audio.title,
+              performer: audio.performer,
+              fileName: audio.file_name,
+            },
+            caption: msg.caption || undefined,
           });
           state.earlyMusicAddedCount = (state.earlyMusicAddedCount || 0) + 1;
           if (state.earlyMusicAddedCount % 5 === 0) {
             await safeSendMessage(bot, msg.chat.id, `🎵 ${state.earlyMusicAddedCount} files queued. Keep sending or /done.`);
           }
         } else {
-          await safeSendMessage(bot, msg.chat.id, "Please send an audio file, or /done to broadcast.");
+          await safeSendMessage(bot, msg.chat.id, "Please send an audio file, or /done to continue.");
+        }
+        return;
+      }
+
+      if (state?.step === "earlymusic_awaiting_wav") {
+        if (!msg.audio) {
+          await safeSendMessage(bot, msg.chat.id, "Please send an audio file for the WAV version.");
+          return;
+        }
+        const files = state.earlyMusicFiles!;
+        const idx = state.earlyMusicCurrentWavIndex!;
+        files[idx]!.wav = {
+          fileId: msg.audio.file_id,
+          fileUniqueId: msg.audio.file_unique_id,
+          title: msg.audio.title,
+          performer: msg.audio.performer,
+          fileName: msg.audio.file_name,
+        };
+        const nextIdx = idx + 1;
+        if (nextIdx < files.length) {
+          state.earlyMusicCurrentWavIndex = nextIdx;
+          const next = files[nextIdx]!;
+          const label = next.normal.title || next.normal.fileName || `File ${nextIdx + 1}`;
+          await bot.sendMessage(
+            msg.chat.id,
+            `Got it! Now send me the WAV file for:\n\n"${label}" (${nextIdx + 1}/${files.length})`
+          );
+        } else {
+          await broadcastEarlyMusic(bot, token, msg.chat.id, userId, state);
         }
         return;
       }
@@ -1999,16 +2105,41 @@ async function processTagFast(
 
 async function broadcastEarlyMusic(
   bot: TelegramBot,
-  _token: string,
+  token: string,
   adminChatId: number,
   adminUserId: number,
   state: UserState
 ) {
-  const files = state.earlyMusicFiles || [];
-  if (files.length === 0) {
+  const pairs = state.earlyMusicFiles || [];
+  if (pairs.length === 0) {
     userStates.delete(adminUserId);
     await bot.sendMessage(adminChatId, "No files to broadcast.");
     return;
+  }
+
+  // Save WAV files to botFiles so getwav_ deep links work
+  for (const pair of pairs) {
+    if (pair.wav) {
+      try {
+        await db
+          .insert(botFilesTable)
+          .values({
+            fileUniqueId: pair.normal.fileUniqueId,
+            fileId: pair.normal.fileId,
+            title: pair.normal.title || null,
+            performer: pair.normal.performer || null,
+            fileName: pair.normal.fileName || null,
+            wavFileUniqueId: pair.wav.fileUniqueId,
+            wavFileId: pair.wav.fileId,
+          })
+          .onConflictDoUpdate({
+            target: botFilesTable.fileUniqueId,
+            set: { fileId: pair.normal.fileId, wavFileUniqueId: pair.wav.fileUniqueId, wavFileId: pair.wav.fileId },
+          });
+      } catch (err) {
+        logger.error({ err }, "Failed to save early music WAV to botFiles");
+      }
+    }
   }
 
   const recipients = await db
@@ -2030,19 +2161,45 @@ async function broadcastEarlyMusic(
 
   const processingMsg = await bot.sendMessage(
     adminChatId,
-    `📤 Sending ${files.length} file${files.length === 1 ? "" : "s"} to ${premiumRecipients.length} subscriber${premiumRecipients.length === 1 ? "" : "s"}...`
+    `📤 Sending ${pairs.length} file${pairs.length === 1 ? "" : "s"} to ${premiumRecipients.length} subscriber${premiumRecipients.length === 1 ? "" : "s"}...`
   );
 
   let successCount = 0;
 
   for (const user of premiumRecipients) {
-    for (const file of files) {
+    for (const pair of pairs) {
       try {
-        await bot.sendAudio(user.userId, file.fileId);
-        successCount++;
+        const sendOptions: Record<string, unknown> = {
+          chat_id: user.userId,
+          audio: pair.normal.fileId,
+          caption: pair.caption || undefined,
+        };
+
+        if (pair.wav) {
+          sendOptions.reply_markup = JSON.stringify({
+            inline_keyboard: [[
+              {
+                text: "Get WAV File",
+                url: `https://t.me/${BOT_USERNAME}?start=getwav_${pair.normal.fileUniqueId}`,
+              },
+            ]],
+          });
+        }
+
+        const res = await fetch(`https://api.telegram.org/bot${token}/sendAudio`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(sendOptions),
+        });
+
+        if (res.ok) {
+          successCount++;
+        } else {
+          logger.warn({ userId: user.userId, status: res.status }, "Failed to send early music");
+        }
         await new Promise((r) => setTimeout(r, 200));
       } catch (err) {
-        logger.warn({ err, userId: user.userId }, "Failed to send early music to user");
+        logger.warn({ err, userId: user.userId }, "Exception sending early music to user");
       }
     }
   }
@@ -2051,7 +2208,7 @@ async function broadcastEarlyMusic(
   userStates.delete(adminUserId);
   await bot.sendMessage(
     adminChatId,
-    `✅ Sent ${files.length} file${files.length === 1 ? "" : "s"} to ${premiumRecipients.length} subscriber${premiumRecipients.length === 1 ? "" : "s"}.`
+    `✅ Sent ${pairs.length} file${pairs.length === 1 ? "" : "s"} to ${premiumRecipients.length} subscriber${premiumRecipients.length === 1 ? "" : "s"}.`
   );
 }
 
