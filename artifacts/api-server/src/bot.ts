@@ -580,7 +580,7 @@ export async function startBot() {
 
         // If there's an OG version, always show "Get OG File" button
         if (file.ogFileUniqueId) {
-          await bot.sendMessage(msg.chat.id, "Want the OG version?", {
+          await bot.sendMessage(msg.chat.id, "Want the OG file?", {
             reply_markup: {
               inline_keyboard: [[
                 {
