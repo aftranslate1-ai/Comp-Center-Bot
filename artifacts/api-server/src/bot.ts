@@ -578,34 +578,18 @@ export async function startBot() {
         const file = rows[0]!;
         await bot.sendAudio(msg.chat.id, file.fileId);
 
-        // If there's an OG version, offer it as a follow-up
+        // If there's an OG version, always show "Get OG File" button
         if (file.ogFileUniqueId) {
-          const premium = await isUserPremium(userId);
-          if (premium) {
-            await bot.sendMessage(msg.chat.id, "Want the OG version?", {
-              reply_markup: {
-                inline_keyboard: [[
-                  {
-                    text: "Download OG",
-                    url: `https://t.me/${BOT_USERNAME}?start=getog_${file.ogFileUniqueId}`,
-                  },
-                ]],
-              },
-            });
-          } else {
-            await bot.sendMessage(
-              msg.chat.id,
-              "Want the OG version? It's available for CC Premium members.",
-              {
-                reply_markup: {
-                  inline_keyboard: [[
-                    { text: "Cancel ❌", callback_data: "cancel_subscribe" },
-                    { text: "Unlock ✨", callback_data: "do_subscribe" },
-                  ]],
+          await bot.sendMessage(msg.chat.id, "Want the OG version?", {
+            reply_markup: {
+              inline_keyboard: [[
+                {
+                  text: "Get OG File",
+                  url: `https://t.me/${BOT_USERNAME}?start=getog_${file.ogFileUniqueId}`,
                 },
-              }
-            );
-          }
+              ]],
+            },
+          });
         }
         return;
       }
