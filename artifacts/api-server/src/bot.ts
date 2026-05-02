@@ -72,7 +72,7 @@ interface FileForwardPair {
 interface EarlyMusicPair {
   normal: TagFile;
   caption?: string;
-  wav?: TagFile;
+  flac?: TagFile;
 }
 
 type UserStep =
@@ -98,7 +98,7 @@ type UserStep =
   | "freepremium_remove_awaiting_user"
   | "freepremium_give_confirm"
   | "earlymusic_collecting"
-  | "earlymusic_awaiting_wav"
+  | "earlymusic_awaiting_flac"
   | "fileforward_collecting"
   | "fileforward_awaiting_og"
   | "fileforward_selecting_chats";
@@ -134,7 +134,7 @@ interface UserState {
   // earlymusic
   earlyMusicFiles?: EarlyMusicPair[];
   earlyMusicAddedCount?: number;
-  earlyMusicCurrentWavIndex?: number;
+  earlyMusicCurrentFlacIndex?: number;
   // fileforward
   fileforwardFiles?: FileForwardPair[];
   fileforwardCurrentOgIndex?: number;
@@ -539,16 +539,16 @@ export async function startBot() {
 
       const payload = (match?.[1] || "").trim();
 
-      if (payload.startsWith("getwav_")) {
-        // WAV file — premium required
-        const fileUniqueId = payload.slice(7);
+      if (payload.startsWith("getflac_")) {
+        // FLAC file — premium required
+        const fileUniqueId = payload.slice(8);
         const premium = await isUserPremium(userId);
 
         if (!premium) {
           await sendPremiumPaywall(
             bot,
             msg.chat.id,
-            "Downloading WAV files is a CC Premium feature."
+            "Downloading FLAC files is a CC Premium feature."
           );
           return;
         }
@@ -559,12 +559,12 @@ export async function startBot() {
           .where(eq(botFilesTable.fileUniqueId, fileUniqueId))
           .limit(1);
 
-        if (rows.length === 0 || !rows[0]!.wavFileId) {
-          await bot.sendMessage(msg.chat.id, "Sorry, I couldn't find that WAV file.");
+        if (rows.length === 0 || !rows[0]!.flacFileId) {
+          await bot.sendMessage(msg.chat.id, "Sorry, I couldn't find that FLAC file.");
           return;
         }
 
-        await bot.sendAudio(msg.chat.id, rows[0]!.wavFileId);
+        await bot.sendAudio(msg.chat.id, rows[0]!.flacFileId);
         return;
       }
 
@@ -972,13 +972,13 @@ export async function startBot() {
           await bot.sendMessage(msg.chat.id, "No files were sent. Cancelled.");
           return;
         }
-        state.earlyMusicCurrentWavIndex = 0;
-        state.step = "earlymusic_awaiting_wav";
+        state.earlyMusicCurrentFlacIndex = 0;
+        state.step = "earlymusic_awaiting_flac";
         const first = files[0]!;
         const label = first.normal.title || first.normal.fileName || `File 1`;
         await bot.sendMessage(
           msg.chat.id,
-          `Got ${files.length} file${files.length === 1 ? "" : "s"}! Now send me the WAV file for:\n\n"${label}" (1/${files.length})`
+          `Got ${files.length} file${files.length === 1 ? "" : "s"}! Now send me the FLAC file for:\n\n"${label}" (1/${files.length})`
         );
       }
     } catch (err) {
@@ -1516,14 +1516,14 @@ export async function startBot() {
         return;
       }
 
-      if (state?.step === "earlymusic_awaiting_wav") {
+      if (state?.step === "earlymusic_awaiting_flac") {
         if (!msg.audio) {
-          await safeSendMessage(bot, msg.chat.id, "Please send an audio file for the WAV version.");
+          await safeSendMessage(bot, msg.chat.id, "Please send an audio file for the FLAC version.");
           return;
         }
         const files = state.earlyMusicFiles!;
-        const idx = state.earlyMusicCurrentWavIndex!;
-        files[idx]!.wav = {
+        const idx = state.earlyMusicCurrentFlacIndex!;
+        files[idx]!.flac = {
           fileId: msg.audio.file_id,
           fileUniqueId: msg.audio.file_unique_id,
           title: msg.audio.title,
@@ -1532,12 +1532,12 @@ export async function startBot() {
         };
         const nextIdx = idx + 1;
         if (nextIdx < files.length) {
-          state.earlyMusicCurrentWavIndex = nextIdx;
+          state.earlyMusicCurrentFlacIndex = nextIdx;
           const next = files[nextIdx]!;
           const label = next.normal.title || next.normal.fileName || `File ${nextIdx + 1}`;
           await bot.sendMessage(
             msg.chat.id,
-            `Got it! Now send me the WAV file for:\n\n"${label}" (${nextIdx + 1}/${files.length})`
+            `Got it! Now send me the FLAC file for:\n\n"${label}" (${nextIdx + 1}/${files.length})`
           );
         } else {
           await broadcastEarlyMusic(bot, token, msg.chat.id, userId, state);
@@ -2117,9 +2117,9 @@ async function broadcastEarlyMusic(
     return;
   }
 
-  // Save WAV files to botFiles so getwav_ deep links work
+  // Save FLAC files to botFiles so getflac_ deep links work
   for (const pair of pairs) {
-    if (pair.wav) {
+    if (pair.flac) {
       try {
         await db
           .insert(botFilesTable)
@@ -2129,15 +2129,15 @@ async function broadcastEarlyMusic(
             title: pair.normal.title || null,
             performer: pair.normal.performer || null,
             fileName: pair.normal.fileName || null,
-            wavFileUniqueId: pair.wav.fileUniqueId,
-            wavFileId: pair.wav.fileId,
+            flacFileUniqueId: pair.flac.fileUniqueId,
+            flacFileId: pair.flac.fileId,
           })
           .onConflictDoUpdate({
             target: botFilesTable.fileUniqueId,
-            set: { fileId: pair.normal.fileId, wavFileUniqueId: pair.wav.fileUniqueId, wavFileId: pair.wav.fileId },
+            set: { fileId: pair.normal.fileId, flacFileUniqueId: pair.flac.fileUniqueId, flacFileId: pair.flac.fileId },
           });
       } catch (err) {
-        logger.error({ err }, "Failed to save early music WAV to botFiles");
+        logger.error({ err }, "Failed to save early music FLAC to botFiles");
       }
     }
   }
@@ -2175,12 +2175,12 @@ async function broadcastEarlyMusic(
           caption: pair.caption || undefined,
         };
 
-        if (pair.wav) {
+        if (pair.flac) {
           sendOptions.reply_markup = JSON.stringify({
             inline_keyboard: [[
               {
-                text: "Get WAV File",
-                url: `https://t.me/${BOT_USERNAME}?start=getwav_${pair.normal.fileUniqueId}`,
+                text: "Get FLAC File",
+                url: `https://t.me/${BOT_USERNAME}?start=getflac_${pair.normal.fileUniqueId}`,
               },
             ]],
           });

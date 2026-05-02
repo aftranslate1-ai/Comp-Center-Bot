@@ -24,6 +24,15 @@ app.listen(port, (err) => {
   }
 
   logger.info({ port }, "Server listening");
+
+  // Self-ping every 5 minutes to keep the bot alive
+  setInterval(async () => {
+    try {
+      await fetch(`http://localhost:${port}/`);
+    } catch {
+      // ignore — server may not have a root route
+    }
+  }, 5 * 60 * 1000);
 });
 
 startBot().catch((err) => {
