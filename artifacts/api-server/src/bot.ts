@@ -124,6 +124,7 @@ interface UserState {
   // fileforward
   fileforwardNormalFile?: TagFile;
   fileforwardOgFile?: TagFile;
+  fileforwardCaption?: string;
 }
 
 const userStates = new Map<number, UserState>();
@@ -1321,6 +1322,7 @@ export async function startBot() {
           performer: msg.audio.performer,
           fileName: msg.audio.file_name,
         };
+        state.fileforwardCaption = msg.caption || undefined;
         state.step = "fileforward_awaiting_og";
         await bot.sendMessage(msg.chat.id, "Got it! Now send me the OG (original quality) file.");
         return;
@@ -2208,6 +2210,7 @@ async function sendFileForwardToChats(
         body: JSON.stringify({
           chat_id: chatId,
           audio: normalFile.fileId,
+          caption: state.fileforwardCaption || undefined,
           reply_markup: replyMarkup,
         }),
       });
