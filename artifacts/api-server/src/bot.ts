@@ -85,7 +85,10 @@ type UserStep =
   | "freepremium_give_awaiting_user"
   | "freepremium_remove_awaiting_user"
   | "freepremium_give_confirm"
-  | "earlymusic_collecting";
+  | "earlymusic_collecting"
+  | "fileforward_awaiting_normal"
+  | "fileforward_awaiting_og"
+  | "fileforward_selecting_chats";
 
 interface ConnectedChatOption {
   chatId: string;
@@ -118,6 +121,9 @@ interface UserState {
   // earlymusic
   earlyMusicFiles?: TagFile[];
   earlyMusicAddedCount?: number;
+  // fileforward
+  fileforwardNormalFile?: TagFile;
+  fileforwardOgFile?: TagFile;
 }
 
 const userStates = new Map<number, UserState>();
@@ -518,15 +524,16 @@ export async function startBot() {
 
       const payload = (match?.[1] || "").trim();
 
-      if (payload.startsWith("get_")) {
-        const fileUniqueId = payload.slice(4);
+      if (payload.startsWith("getog_")) {
+        // OG file — premium required
+        const fileUniqueId = payload.slice(6);
         const premium = await isUserPremium(userId);
 
         if (!premium) {
           await sendPremiumPaywall(
             bot,
             msg.chat.id,
-            "Downloading files is a CC Premium feature."
+            "Downloading OG files is a CC Premium feature."
           );
           return;
         }
@@ -542,8 +549,26 @@ export async function startBot() {
           return;
         }
 
-        const file = rows[0]!;
-        await bot.sendAudio(msg.chat.id, file.fileId);
+        await bot.sendAudio(msg.chat.id, rows[0]!.fileId);
+        return;
+      }
+
+      if (payload.startsWith("get_")) {
+        // Normal file — free for everyone
+        const fileUniqueId = payload.slice(4);
+
+        const rows = await db
+          .select()
+          .from(botFilesTable)
+          .where(eq(botFilesTable.fileUniqueId, fileUniqueId))
+          .limit(1);
+
+        if (rows.length === 0) {
+          await bot.sendMessage(msg.chat.id, "Sorry, I couldn't find that file.");
+          return;
+        }
+
+        await bot.sendAudio(msg.chat.id, rows[0]!.fileId);
         return;
       }
 
@@ -739,6 +764,25 @@ export async function startBot() {
       );
     } catch (err) {
       logger.error({ err }, "Error handling /publicearlymusic");
+    }
+  });
+
+  // ─── /fileforward (admin) ────────────────────────────────────────────────────
+
+  bot.onText(/\/fileforward/, async (msg) => {
+    try {
+      if (msg.chat.type !== "private") return;
+      if (msg.from?.username !== AUTHORIZED_USERNAME) {
+        await bot.sendMessage(msg.chat.id, "This is not an available command.");
+        return;
+      }
+      userStates.set(msg.from!.id, { step: "fileforward_awaiting_normal", buttons: [] });
+      await bot.sendMessage(
+        msg.chat.id,
+        "Send me the normal (compressed) audio file first."
+      );
+    } catch (err) {
+      logger.error({ err }, "Error handling /fileforward");
     }
   });
 
@@ -1051,7 +1095,11 @@ export async function startBot() {
           return;
         }
         try { await bot.deleteMessage(chatId, msgId); } catch { }
-        await sendToSelectedChats(bot, token, state, chatId, state.selectedChatIds);
+        if (state.step === "fileforward_selecting_chats") {
+          await sendFileForwardToChats(bot, token, state, chatId, state.selectedChatIds);
+        } else {
+          await sendToSelectedChats(bot, token, state, chatId, state.selectedChatIds);
+        }
         userStates.delete(userId);
 
       } else if (query.data?.startsWith("toggle_")) {
@@ -1220,11 +1268,48 @@ export async function startBot() {
         msg.text?.startsWith("/tagmp3") ||
         msg.text?.startsWith("/freepremium") ||
         msg.text?.startsWith("/publicearlymusic") ||
-        msg.text?.startsWith("/subscribe")
+        msg.text?.startsWith("/subscribe") ||
+        msg.text?.startsWith("/fileforward")
       ) return;
 
       const userId = msg.from.id;
       const state = userStates.get(userId);
+
+      // ── File forward collection ──────────────────────────────────────────────
+
+      if (state?.step === "fileforward_awaiting_normal") {
+        if (!msg.audio) {
+          await safeSendMessage(bot, msg.chat.id, "Please send an audio file.");
+          return;
+        }
+        state.fileforwardNormalFile = {
+          fileId: msg.audio.file_id,
+          fileUniqueId: msg.audio.file_unique_id,
+          title: msg.audio.title,
+          performer: msg.audio.performer,
+          fileName: msg.audio.file_name,
+        };
+        state.step = "fileforward_awaiting_og";
+        await bot.sendMessage(msg.chat.id, "Got it! Now send me the OG (original quality) file.");
+        return;
+      }
+
+      if (state?.step === "fileforward_awaiting_og") {
+        if (!msg.audio) {
+          await safeSendMessage(bot, msg.chat.id, "Please send an audio file for the OG version.");
+          return;
+        }
+        state.fileforwardOgFile = {
+          fileId: msg.audio.file_id,
+          fileUniqueId: msg.audio.file_unique_id,
+          title: msg.audio.title,
+          performer: msg.audio.performer,
+          fileName: msg.audio.file_name,
+        };
+        state.step = "fileforward_selecting_chats";
+        await showChatPicker(bot, chatId, state);
+        return;
+      }
 
       // ── Inline audio collection ──────────────────────────────────────────────
 
@@ -1988,39 +2073,6 @@ async function sendToSelectedChats(
     replyMarkup = { inline_keyboard: state.buttons.map((b) => [{ text: b.text, url: b.url }]) };
   }
 
-  // If audio: auto-save to botFiles + add Download button
-  if (originalMsg.audio) {
-    const audio = originalMsg.audio;
-    try {
-      await db
-        .insert(botFilesTable)
-        .values({
-          fileUniqueId: audio.file_unique_id,
-          fileId: audio.file_id,
-          title: audio.title || null,
-          performer: audio.performer || null,
-          fileName: audio.file_name || null,
-        })
-        .onConflictDoUpdate({
-          target: botFilesTable.fileUniqueId,
-          set: { fileId: audio.file_id },
-        });
-    } catch (err) {
-      logger.error({ err }, "Failed to save broadcast audio to botFiles");
-    }
-
-    const downloadButton: TelegramBot.InlineKeyboardButton = {
-      text: "Download ⬇️",
-      url: `https://t.me/${BOT_USERNAME}?start=get_${audio.file_unique_id}`,
-    };
-
-    if (replyMarkup) {
-      replyMarkup.inline_keyboard.push([downloadButton]);
-    } else {
-      replyMarkup = { inline_keyboard: [[downloadButton]] };
-    }
-  }
-
   let successCount = 0;
   let failCount = 0;
   let removedCount = 0;
@@ -2051,6 +2103,106 @@ async function sendToSelectedChats(
   }
 
   const parts: string[] = [`Message sent to ${successCount} chat(s).`];
+  if (removedCount > 0) parts.push(`${removedCount} removed (bot was banned).`);
+  if (failCount > 0) parts.push(`${failCount} failed.`);
+  await bot.sendMessage(adminChatId, parts.join(" "));
+}
+
+// ─── File forward (normal + OG with download buttons) ─────────────────────────
+
+async function sendFileForwardToChats(
+  bot: TelegramBot,
+  token: string,
+  state: UserState,
+  adminChatId: number,
+  selectedIds: Set<string>
+) {
+  const normalFile = state.fileforwardNormalFile!;
+  const ogFile = state.fileforwardOgFile!;
+
+  // Save both files to botFiles for deep-link retrieval
+  try {
+    await db
+      .insert(botFilesTable)
+      .values({
+        fileUniqueId: normalFile.fileUniqueId,
+        fileId: normalFile.fileId,
+        title: normalFile.title || null,
+        performer: normalFile.performer || null,
+        fileName: normalFile.fileName || null,
+      })
+      .onConflictDoUpdate({ target: botFilesTable.fileUniqueId, set: { fileId: normalFile.fileId } });
+
+    await db
+      .insert(botFilesTable)
+      .values({
+        fileUniqueId: ogFile.fileUniqueId,
+        fileId: ogFile.fileId,
+        title: ogFile.title || null,
+        performer: ogFile.performer || null,
+        fileName: ogFile.fileName || null,
+      })
+      .onConflictDoUpdate({ target: botFilesTable.fileUniqueId, set: { fileId: ogFile.fileId } });
+  } catch (err) {
+    logger.error({ err }, "Failed to save fileforward files to botFiles");
+  }
+
+  const replyMarkup = {
+    inline_keyboard: [
+      [
+        {
+          text: "Download ⬇️",
+          url: `https://t.me/${BOT_USERNAME}?start=get_${normalFile.fileUniqueId}`,
+        },
+        {
+          text: "Download OG ⬇️ ✨",
+          url: `https://t.me/${BOT_USERNAME}?start=getog_${ogFile.fileUniqueId}`,
+        },
+      ],
+    ],
+  };
+
+  let successCount = 0;
+  let failCount = 0;
+  let removedCount = 0;
+
+  for (const chatId of selectedIds) {
+    // Send the normal file as the visible message, with both download buttons
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${token}/sendAudio`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          audio: normalFile.fileId,
+          reply_markup: replyMarkup,
+        }),
+      });
+
+      if (res.ok) {
+        successCount++;
+      } else {
+        const text = await res.text();
+        if (isBanError(res.status, text)) {
+          removedCount++;
+          logger.warn({ chatId, error: text }, "Bot banned during fileforward — removing from DB");
+          try {
+            await db.delete(connectedChatsTable).where(eq(connectedChatsTable.chatId, BigInt(chatId)));
+          } catch (dbErr) {
+            logger.error({ dbErr }, "Failed to remove banned chat");
+          }
+        } else {
+          failCount++;
+          logger.error({ chatId, error: `${res.status} ${text}` }, "Failed to fileforward to chat");
+        }
+      }
+    } catch (err) {
+      failCount++;
+      logger.error({ err, chatId }, "Exception during fileforward send");
+    }
+  }
+
+  const parts: string[] = [`File sent to ${successCount} chat(s).`];
   if (removedCount > 0) parts.push(`${removedCount} removed (bot was banned).`);
   if (failCount > 0) parts.push(`${failCount} failed.`);
   await bot.sendMessage(adminChatId, parts.join(" "));
