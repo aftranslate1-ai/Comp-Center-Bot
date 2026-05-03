@@ -785,6 +785,7 @@ export async function startBot() {
         `• /publicforward — Broadcast a message to all connected channels\n` +
         `• /publicfile — Add songs to the inline audio library\n` +
         `• /removefile — Remove songs from the inline audio library\n` +
+        `• /fixcovers — Auto-add cover art from file metadata to all songs\n` +
         `• /publicearlymusic — Send early music to premium subscribers\n` +
         `• /fileforward — Forward files with Download & OG buttons to channels\n` +
         `• /freepremium — Give or remove free premium for a user`,
@@ -942,6 +943,126 @@ export async function startBot() {
       });
     } catch (err) {
       logger.error({ err }, "Error handling /removefile");
+    }
+  });
+
+  // ─── /fixcovers (admin) ──────────────────────────────────────────────────────
+
+  bot.onText(/\/fixcovers/, async (msg) => {
+    try {
+      if (msg.chat.type !== "private") return;
+      if (!await isAdmin(msg.from!.id, msg.from?.username)) {
+        await bot.sendMessage(msg.chat.id, "This is not an available command.");
+        return;
+      }
+
+      const chatId = msg.chat.id;
+      const allSongs = await db.select().from(inlineAudioFilesTable);
+      const needsFix = allSongs.filter((s) => !s.thumbnailFileId);
+
+      if (needsFix.length === 0) {
+        await bot.sendMessage(chatId, "✅ All songs already have cover art embedded!");
+        return;
+      }
+
+      const statusMsg = await bot.sendMessage(
+        chatId,
+        `🖼️ Found ${needsFix.length} song(s) without cover art. Extracting from file metadata...`
+      );
+
+      let successCount = 0;
+      let noCoverCount = 0;
+      let failCount = 0;
+      let processed = 0;
+
+      for (const song of needsFix) {
+        processed++;
+        try {
+          const audioBuffer = await downloadTelegramFile(token, song.fileId);
+          const tags = NodeID3.read(audioBuffer);
+          const image = tags.image;
+
+          if (!image || typeof image !== "object" || !("imageBuffer" in image) || !image.imageBuffer) {
+            noCoverCount++;
+            continue;
+          }
+
+          const coverBuffer = Buffer.isBuffer(image.imageBuffer)
+            ? image.imageBuffer
+            : Buffer.from(image.imageBuffer as Uint8Array);
+
+          // Upload cover art as a photo to get a Telegram file_id
+          const photoFd = new FormData();
+          photoFd.append("chat_id", String(chatId));
+          photoFd.append("photo", new Blob([coverBuffer], { type: "image/jpeg" }), "cover.jpg");
+
+          const photoRes = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
+            method: "POST",
+            body: photoFd,
+          });
+          const photoData = await photoRes.json() as {
+            ok: boolean;
+            result?: { message_id: number; photo?: Array<{ file_id: string }> };
+          };
+
+          if (!photoData.ok || !photoData.result?.photo?.length) {
+            failCount++;
+            continue;
+          }
+
+          const photoFileId = photoData.result.photo[photoData.result.photo.length - 1]!.file_id;
+          try { await bot.deleteMessage(chatId, photoData.result.message_id); } catch { }
+
+          // Re-send audio with thumbnail to get a new file_id that has cover art embedded
+          const audioRes = await fetch(`https://api.telegram.org/bot${token}/sendAudio`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: chatId, audio: song.fileId, thumbnail: photoFileId }),
+          });
+          const audioData = await audioRes.json() as {
+            ok: boolean;
+            result?: { message_id: number; audio?: { file_id: string } };
+          };
+
+          if (!audioData.ok || !audioData.result?.audio?.file_id) {
+            failCount++;
+            continue;
+          }
+
+          const newFileId = audioData.result.audio.file_id;
+          try { await bot.deleteMessage(chatId, audioData.result.message_id); } catch { }
+
+          await db
+            .update(inlineAudioFilesTable)
+            .set({ fileId: newFileId, thumbnailFileId: photoFileId })
+            .where(eq(inlineAudioFilesTable.id, song.id));
+
+          successCount++;
+        } catch (err) {
+          logger.error({ err, songId: song.id }, "Error fixing cover art");
+          failCount++;
+        }
+
+        await new Promise((r) => setTimeout(r, 400));
+
+        if (processed % 5 === 0 || processed === needsFix.length) {
+          try {
+            await bot.editMessageText(
+              `🖼️ Progress: ${processed}/${needsFix.length}\n✅ Fixed: ${successCount}\n⏭️ No embedded art: ${noCoverCount}\n❌ Failed: ${failCount}`,
+              { chat_id: chatId, message_id: statusMsg.message_id }
+            );
+          } catch { }
+        }
+      }
+
+      try {
+        await bot.editMessageText(
+          `✅ Done!\n\n🖼️ ${successCount} song${successCount === 1 ? "" : "s"} now have cover art\n⏭️ ${noCoverCount} had no embedded art in file metadata\n❌ ${failCount} failed`,
+          { chat_id: chatId, message_id: statusMsg.message_id }
+        );
+      } catch { }
+    } catch (err) {
+      logger.error({ err }, "Error handling /fixcovers");
     }
   });
 
