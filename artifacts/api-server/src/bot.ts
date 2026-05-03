@@ -7,6 +7,7 @@ import {
   inlineAudioFilesTable,
   usersTable,
   botFilesTable,
+  botAdminsTable,
 } from "@workspace/db/schema";
 import { logger } from "./lib/logger";
 import { eq, ilike, and, desc } from "drizzle-orm";
@@ -99,6 +100,7 @@ type UserStep =
   | "freepremium_give_confirm"
   | "earlymusic_collecting"
   | "earlymusic_awaiting_flac"
+  | "admin_awaiting_new_admin"
   | "fileforward_collecting"
   | "fileforward_awaiting_og"
   | "fileforward_selecting_chats";
@@ -138,11 +140,19 @@ interface UserState {
   // fileforward
   fileforwardFiles?: FileForwardPair[];
   fileforwardCurrentOgIndex?: number;
+  // admin
+  adminTarget?: { userId: number; username?: string };
 }
 
 const userStates = new Map<number, UserState>();
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+async function isAdmin(userId: number, username?: string): Promise<boolean> {
+  if (username === AUTHORIZED_USERNAME) return true;
+  const rows = await db.select().from(botAdminsTable).where(eq(botAdminsTable.userId, userId)).limit(1);
+  return rows.length > 0;
+}
 
 async function safeSendMessage(
   bot: TelegramBot,
@@ -159,27 +169,15 @@ async function safeSendMessage(
 }
 
 async function getOrCreateUser(userId: number, username?: string) {
-  const existing = await db
-    .select()
-    .from(usersTable)
-    .where(eq(usersTable.userId, userId))
-    .limit(1);
-
-  if (existing.length > 0) {
-    if (username && existing[0]!.username !== username) {
-      await db
-        .update(usersTable)
-        .set({ username })
-        .where(eq(usersTable.userId, userId));
-    }
-    return existing[0]!;
-  }
-
-  const inserted = await db
+  const rows = await db
     .insert(usersTable)
     .values({ userId, username: username || null })
+    .onConflictDoUpdate({
+      target: usersTable.userId,
+      set: { username: username || null },
+    })
     .returning();
-  return inserted[0]!;
+  return rows[0]!;
 }
 
 async function isUserPremium(userId: number): Promise<boolean> {
@@ -774,12 +772,50 @@ export async function startBot() {
     }
   });
 
+  // ─── /admin (admin) ──────────────────────────────────────────────────────────
+
+  bot.onText(/\/admin/, async (msg) => {
+    try {
+      if (msg.chat.type !== "private") return;
+      if (!await isAdmin(msg.from!.id, msg.from?.username)) {
+        await bot.sendMessage(msg.chat.id, "This is not an available command.");
+        return;
+      }
+      await bot.sendMessage(
+        msg.chat.id,
+        `🛠️ *Admin Panel*\n\nHere are all the available admin commands:\n\n` +
+        `• /publicforward — Broadcast a message to all connected channels\n` +
+        `• /publicfile — Add songs to the inline audio library\n` +
+        `• /removefile — Remove songs from the inline audio library\n` +
+        `• /publicearlymusic — Send early music to premium subscribers\n` +
+        `• /fileforward — Forward files with Download & OG buttons to channels\n` +
+        `• /freepremium — Give or remove free premium for a user`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "👑 Premium Subscribers", callback_data: "admin_premiumlist" },
+                { text: "🎵 Early Music Subscribers", callback_data: "admin_earlymusic" },
+              ],
+              [
+                { text: "➕ Add Admin", callback_data: "admin_addadmin" },
+              ],
+            ],
+          },
+        }
+      );
+    } catch (err) {
+      logger.error({ err }, "Error handling /admin");
+    }
+  });
+
   // ─── /freepremium (admin) ────────────────────────────────────────────────────
 
   bot.onText(/\/freepremium/, async (msg) => {
     try {
       if (msg.chat.type !== "private") return;
-      if (msg.from?.username !== AUTHORIZED_USERNAME) {
+      if (!await isAdmin(msg.from!.id, msg.from?.username)) {
         await bot.sendMessage(msg.chat.id, "This is not an available command.");
         return;
       }
@@ -807,7 +843,7 @@ export async function startBot() {
   bot.onText(/\/publicearlymusic/, async (msg) => {
     try {
       if (msg.chat.type !== "private") return;
-      if (msg.from?.username !== AUTHORIZED_USERNAME) {
+      if (!await isAdmin(msg.from!.id, msg.from?.username)) {
         await bot.sendMessage(msg.chat.id, "This is not an available command.");
         return;
       }
@@ -831,7 +867,7 @@ export async function startBot() {
   bot.onText(/\/fileforward/, async (msg) => {
     try {
       if (msg.chat.type !== "private") return;
-      if (msg.from?.username !== AUTHORIZED_USERNAME) {
+      if (!await isAdmin(msg.from!.id, msg.from?.username)) {
         await bot.sendMessage(msg.chat.id, "This is not an available command.");
         return;
       }
@@ -854,7 +890,7 @@ export async function startBot() {
   bot.onText(/\/publicfile/, async (msg) => {
     try {
       if (msg.chat.type !== "private") return;
-      if (msg.from?.username !== AUTHORIZED_USERNAME) {
+      if (!await isAdmin(msg.from!.id, msg.from?.username)) {
         await bot.sendMessage(msg.chat.id, "This is not an available command.");
         return;
       }
@@ -873,7 +909,7 @@ export async function startBot() {
   bot.onText(/\/removefile/, async (msg) => {
     try {
       if (msg.chat.type !== "private") return;
-      if (msg.from?.username !== AUTHORIZED_USERNAME) {
+      if (!await isAdmin(msg.from!.id, msg.from?.username)) {
         await bot.sendMessage(msg.chat.id, "This is not an available command.");
         return;
       }
@@ -991,7 +1027,7 @@ export async function startBot() {
   bot.onText(/\/publicforward/, async (msg) => {
     try {
       if (msg.chat.type !== "private") return;
-      if (msg.from?.username !== AUTHORIZED_USERNAME) {
+      if (!await isAdmin(msg.from!.id, msg.from?.username)) {
         await bot.sendMessage(msg.chat.id, "This is not an available command.");
         return;
       }
@@ -1083,6 +1119,73 @@ export async function startBot() {
         if (!state || state.step !== "fileforward_collecting") return;
         try { await bot.deleteMessage(chatId, msgId); } catch { }
         await showChatPicker(bot, chatId, state, "fileforward_selecting_chats");
+        return;
+      }
+
+      // ── Admin panel callbacks ────────────────────────────────────────────────
+
+      if (query.data === "admin_premiumlist") {
+        if (!await isAdmin(userId, query.from.username)) return;
+        const rows = await db.select().from(usersTable).where(eq(usersTable.isPremium, true));
+        if (rows.length === 0) {
+          await bot.sendMessage(chatId, "No premium subscribers yet.");
+          return;
+        }
+        const lines = rows.map((u, i) => {
+          const name = u.username ? `@${u.username}` : `ID: ${u.userId}`;
+          const type = u.premiumFree ? "Free" : "Paid";
+          const expiry = u.premiumExpiry
+            ? u.premiumExpiry.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })
+            : "No expiry";
+          const cancelled = u.subscriptionCancelled ? " (cancelled)" : "";
+          return `${i + 1}. ${name} — ${type}, expires ${expiry}${cancelled}`;
+        });
+        const chunks: string[] = [];
+        let current = `👑 *Premium Subscribers (${rows.length})*\n\n`;
+        for (const line of lines) {
+          if ((current + line + "\n").length > 3900) {
+            chunks.push(current);
+            current = "";
+          }
+          current += line + "\n";
+        }
+        if (current) chunks.push(current);
+        for (const chunk of chunks) {
+          await bot.sendMessage(chatId, chunk, { parse_mode: "Markdown" });
+        }
+        return;
+
+      } else if (query.data === "admin_earlymusic") {
+        if (!await isAdmin(userId, query.from.username)) return;
+        const rows = await db.select().from(usersTable).where(eq(usersTable.earlyMusicEnabled, true));
+        if (rows.length === 0) {
+          await bot.sendMessage(chatId, "No users have early music enabled yet.");
+          return;
+        }
+        const lines = rows.map((u, i) => {
+          const name = u.username ? `@${u.username}` : `ID: ${u.userId}`;
+          const premiumStatus = u.isPremium ? "✅ Premium" : "❌ Not premium";
+          return `${i + 1}. ${name} — ${premiumStatus}`;
+        });
+        const chunks: string[] = [];
+        let current = `🎵 *Early Music Subscribers (${rows.length})*\n\n`;
+        for (const line of lines) {
+          if ((current + line + "\n").length > 3900) {
+            chunks.push(current);
+            current = "";
+          }
+          current += line + "\n";
+        }
+        if (current) chunks.push(current);
+        for (const chunk of chunks) {
+          await bot.sendMessage(chatId, chunk, { parse_mode: "Markdown" });
+        }
+        return;
+
+      } else if (query.data === "admin_addadmin") {
+        if (!await isAdmin(userId, query.from.username)) return;
+        userStates.set(userId, { step: "admin_awaiting_new_admin", buttons: [] });
+        await bot.sendMessage(chatId, "Send me the @username or Telegram ID of the user you'd like to make an admin.");
         return;
       }
 
@@ -1543,6 +1646,40 @@ export async function startBot() {
         } else {
           await broadcastEarlyMusic(bot, token, msg.chat.id, userId, state);
         }
+        return;
+      }
+
+      // ── Add admin ────────────────────────────────────────────────────────────
+
+      if (state?.step === "admin_awaiting_new_admin") {
+        const input = msg.text?.trim() || "";
+        let targetUser: typeof import("@workspace/db/schema").usersTable.$inferSelect | undefined;
+
+        if (input.startsWith("@")) {
+          const uname = input.slice(1);
+          const rows = await db.select().from(usersTable).where(eq(usersTable.username, uname)).limit(1);
+          targetUser = rows[0];
+        } else {
+          const id = parseInt(input, 10);
+          if (!isNaN(id)) {
+            const rows = await db.select().from(usersTable).where(eq(usersTable.userId, id)).limit(1);
+            targetUser = rows[0];
+          }
+        }
+
+        if (!targetUser) {
+          await bot.sendMessage(msg.chat.id, "User not found. Make sure they've started the bot first. Try their @username or Telegram ID.");
+          return;
+        }
+
+        await db
+          .insert(botAdminsTable)
+          .values({ userId: targetUser.userId, username: targetUser.username || null })
+          .onConflictDoUpdate({ target: botAdminsTable.userId, set: { username: targetUser.username || null } });
+
+        userStates.delete(userId);
+        const name = targetUser.username ? `@${targetUser.username}` : `ID: ${targetUser.userId}`;
+        await bot.sendMessage(msg.chat.id, `✅ ${name} has been added as an admin. They now have access to all admin commands.`);
         return;
       }
 
