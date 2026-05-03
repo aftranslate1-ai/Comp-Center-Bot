@@ -155,6 +155,7 @@ interface UserState {
 }
 
 const userStates = new Map<number, UserState>();
+const channelUpdateTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -798,6 +799,7 @@ export async function startBot() {
         `• /publicfile — Add songs to the inline audio library\n` +
         `• /removefile — Remove songs from the inline audio library\n` +
         `• /fixcovers — Auto-add cover art from file metadata to all songs\n` +
+        `• /channelupdate — Send an update notice to a channel with a mute button\n` +
         `• /publicearlymusic — Send early music to premium subscribers\n` +
         `• /fileforward — Forward files with Download & OG buttons to channels\n` +
         `• /freepremium — Give or remove free premium for a user`,
@@ -1176,6 +1178,33 @@ export async function startBot() {
     }
   });
 
+  // ─── /channelupdate (admin) ──────────────────────────────────────────────────
+
+  bot.onText(/\/channelupdate/, async (msg) => {
+    try {
+      if (msg.chat.type !== "private") return;
+      if (!await isAdmin(msg.from!.id, msg.from?.username)) {
+        await bot.sendMessage(msg.chat.id, "This is not an available command.");
+        return;
+      }
+      const chats = await db.select().from(connectedChatsTable);
+      if (chats.length === 0) {
+        await bot.sendMessage(msg.chat.id, "No connected channels found. Add the bot to a channel first.");
+        return;
+      }
+      const keyboard = chats.map((c) => ([{
+        text: c.chatTitle || `Chat ${c.chatId}`,
+        callback_data: `cu_pick_${c.chatId}`,
+      }]));
+      keyboard.push([{ text: "Cancel ❌", callback_data: "cu_cancel" }]);
+      await bot.sendMessage(msg.chat.id, "Which channel do you want to send the update notice to?", {
+        reply_markup: { inline_keyboard: keyboard },
+      });
+    } catch (err) {
+      logger.error({ err }, "Error handling /channelupdate");
+    }
+  });
+
   // ─── /publicforward (admin) ──────────────────────────────────────────────────
 
   bot.onText(/\/publicforward/, async (msg) => {
@@ -1200,6 +1229,32 @@ export async function startBot() {
   bot.on("callback_query", async (query) => {
     try {
       if (!query.message || !query.from) return;
+
+      // ── Channel update mute (must answer before generic answer below) ─────────
+      if (query.data?.startsWith("cu_mute_")) {
+        const channelChatId = query.data.slice("cu_mute_".length);
+        const timerKey = `${channelChatId}_${query.message.message_id}`;
+        await bot.answerCallbackQuery(query.id, {
+          text: "Gotcha! Go ahead and mute the channel 🔔. We'll post here when updates are done in 5 minutes.",
+          show_alert: true,
+        });
+        if (!channelUpdateTimers.has(timerKey)) {
+          const t = setTimeout(async () => {
+            channelUpdateTimers.delete(timerKey);
+            try {
+              await bot.sendMessage(
+                Number(channelChatId),
+                "✅ Channel updates are complete! You can unmute notifications now."
+              );
+            } catch (err) {
+              logger.error({ err }, "Error sending channel update completion");
+            }
+          }, 5 * 60 * 1000);
+          channelUpdateTimers.set(timerKey, t);
+        }
+        return;
+      }
+
       await bot.answerCallbackQuery(query.id);
 
       const userId = query.from.id;
@@ -1457,6 +1512,26 @@ export async function startBot() {
         state.step = "broadcast_awaiting_button_text";
         await bot.sendMessage(chatId, "Send text for your button (or /back to go back):");
 
+      } else if (query.data === "cu_cancel") {
+        try { await bot.deleteMessage(chatId, msgId); } catch { }
+        await bot.sendMessage(chatId, "Cancelled.");
+
+      } else if (query.data?.startsWith("cu_pick_")) {
+        const targetChatId = query.data.slice("cu_pick_".length);
+        try { await bot.deleteMessage(chatId, msgId); } catch { }
+        await bot.sendMessage(
+          Number(targetChatId),
+          "📢 This channel is being updated. Would you like to mute it to avoid pings?",
+          {
+            reply_markup: {
+              inline_keyboard: [[
+                { text: "Mute while updating 🔔", callback_data: `cu_mute_${targetChatId}` },
+              ]],
+            },
+          }
+        );
+        await bot.sendMessage(chatId, "✅ Update notice sent to the channel!");
+
       } else if (query.data === "cancel_broadcast") {
         userStates.delete(userId);
         try { await bot.deleteMessage(chatId, msgId); } catch { }
@@ -1642,7 +1717,8 @@ export async function startBot() {
         msg.text?.startsWith("/freepremium") ||
         msg.text?.startsWith("/publicearlymusic") ||
         msg.text?.startsWith("/subscribe") ||
-        msg.text?.startsWith("/fileforward")
+        msg.text?.startsWith("/fileforward") ||
+        msg.text?.startsWith("/channelupdate")
       ) return;
 
       const userId = msg.from.id;
