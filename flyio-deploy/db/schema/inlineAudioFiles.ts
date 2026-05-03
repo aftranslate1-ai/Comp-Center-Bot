@@ -9,6 +9,7 @@ export const inlineAudioFilesTable = pgTable("inline_audio_files", {
   fileName: text("file_name"),
   duration: integer("duration"),
   searchText: text("search_text").notNull(),
+  thumbnailFileId: text("thumbnail_file_id"),
   addedAt: timestamp("added_at").defaultNow().notNull(),
 });
 

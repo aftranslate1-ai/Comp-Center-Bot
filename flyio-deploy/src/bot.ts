@@ -86,6 +86,7 @@ type UserStep =
   | "broadcast_awaiting_button_url"
   | "broadcast_selecting_chats"
   | "inline_awaiting_audio"
+  | "inline_awaiting_thumbnail"
   | "removefile_browsing"
   | "removefile_searching"
   | "tagmp3_awaiting_file_normal"
@@ -122,6 +123,15 @@ interface UserState {
   removeFilePage?: number;
   removeFileMessageId?: number;
   inlineAddedCount?: number;
+  inlinePendingFile?: {
+    fileId: string;
+    fileUniqueId: string;
+    title?: string;
+    performer?: string;
+    fileName?: string;
+    duration?: number;
+    caption?: string;
+  };
   // tagmp3
   tagFiles?: TagFile[];
   tagCoverArtFileId?: string;
@@ -948,7 +958,28 @@ export async function startBot() {
         userStates.delete(userId);
         await safeSendMessage(bot, msg.chat.id, "All done! Your files have been tagged.");
 
-      } else if (state.step === "inline_awaiting_audio") {
+      } else if (state.step === "inline_awaiting_audio" || state.step === "inline_awaiting_thumbnail") {
+        if (state.step === "inline_awaiting_thumbnail" && state.inlinePendingFile) {
+          const pending = state.inlinePendingFile;
+          const searchText = [pending.title, pending.performer, pending.fileName, pending.caption].filter(Boolean).join(" ") || pending.fileUniqueId;
+          try {
+            await db.insert(inlineAudioFilesTable).values({
+              fileUniqueId: pending.fileUniqueId,
+              fileId: pending.fileId,
+              title: pending.title || null,
+              performer: pending.performer || null,
+              fileName: pending.fileName || null,
+              duration: pending.duration || null,
+              searchText,
+            }).onConflictDoUpdate({
+              target: inlineAudioFilesTable.fileUniqueId,
+              set: { fileId: pending.fileId, title: pending.title || null, performer: pending.performer || null, fileName: pending.fileName || null, duration: pending.duration || null, searchText, addedAt: new Date() },
+            });
+            state.inlineAddedCount = (state.inlineAddedCount || 0) + 1;
+          } catch (err) {
+            logger.error({ err }, "Error saving pending inline audio on /done");
+          }
+        }
         const total = state.inlineAddedCount || 0;
         userStates.delete(userId);
         await safeSendMessage(
@@ -1501,42 +1532,99 @@ export async function startBot() {
       if (state?.step === "inline_awaiting_audio") {
         if (msg.audio) {
           const audio = msg.audio;
-          const searchText = [audio.title, audio.performer, audio.file_name, msg.caption]
-            .filter(Boolean)
-            .join(" ");
-          try {
-            await db
-              .insert(inlineAudioFilesTable)
-              .values({
-                fileUniqueId: audio.file_unique_id,
-                fileId: audio.file_id,
-                title: audio.title || null,
-                performer: audio.performer || null,
-                fileName: audio.file_name || null,
-                duration: audio.duration || null,
-                searchText,
-              })
-              .onConflictDoUpdate({
-                target: inlineAudioFilesTable.fileUniqueId,
-                set: {
-                  fileId: audio.file_id,
-                  title: audio.title || null,
-                  performer: audio.performer || null,
-                  fileName: audio.file_name || null,
-                  duration: audio.duration || null,
-                  searchText,
-                  addedAt: new Date(),
-                },
-              });
-            state.inlineAddedCount = (state.inlineAddedCount || 0) + 1;
-            if (state.inlineAddedCount % 5 === 0) {
-              await safeSendMessage(bot, msg.chat.id, `✅ Added ${state.inlineAddedCount} so far. Keep sending, or /done when finished.`);
-            }
-          } catch (err) {
-            logger.error({ err }, "Error saving inline audio");
-          }
+          const label = audio.title || audio.file_name || "this file";
+          state.inlinePendingFile = {
+            fileId: audio.file_id,
+            fileUniqueId: audio.file_unique_id,
+            title: audio.title,
+            performer: audio.performer,
+            fileName: audio.file_name,
+            duration: audio.duration,
+            caption: msg.caption,
+          };
+          state.step = "inline_awaiting_thumbnail";
+          await bot.sendMessage(
+            msg.chat.id,
+            `Got "${label}"! Now send the cover art for this song (send a photo), or type "skip" to add without cover art.`
+          );
         } else {
           await safeSendMessage(bot, msg.chat.id, "Please send an audio file, or /done when finished.");
+        }
+        return;
+      }
+
+      // ── Inline thumbnail collection ───────────────────────────────────────────
+
+      if (state?.step === "inline_awaiting_thumbnail") {
+        const pending = state.inlinePendingFile;
+        if (!pending) { state.step = "inline_awaiting_audio"; return; }
+        const searchText = [pending.title, pending.performer, pending.fileName, pending.caption]
+          .filter(Boolean).join(" ") || pending.fileUniqueId;
+
+        if (msg.photo && msg.photo.length > 0) {
+          const bestPhoto = msg.photo[msg.photo.length - 1]!;
+          const photoFileId = bestPhoto.file_id;
+          let savedFileId = pending.fileId;
+          try {
+            const res = await fetch(`https://api.telegram.org/bot${token}/sendAudio`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ chat_id: msg.chat.id, audio: pending.fileId, thumbnail: photoFileId }),
+            });
+            const data = await res.json() as { ok: boolean; result?: { message_id: number; audio?: { file_id: string } } };
+            if (data.ok && data.result?.audio?.file_id) {
+              savedFileId = data.result.audio.file_id;
+              try { await bot.deleteMessage(msg.chat.id, data.result.message_id); } catch { }
+            }
+          } catch (err) {
+            logger.error({ err }, "Error re-sending audio with thumbnail, saving without");
+          }
+          try {
+            await db.insert(inlineAudioFilesTable).values({
+              fileUniqueId: pending.fileUniqueId,
+              fileId: savedFileId,
+              title: pending.title || null,
+              performer: pending.performer || null,
+              fileName: pending.fileName || null,
+              duration: pending.duration || null,
+              searchText,
+              thumbnailFileId: photoFileId,
+            }).onConflictDoUpdate({
+              target: inlineAudioFilesTable.fileUniqueId,
+              set: { fileId: savedFileId, title: pending.title || null, performer: pending.performer || null, fileName: pending.fileName || null, duration: pending.duration || null, searchText, thumbnailFileId: photoFileId, addedAt: new Date() },
+            });
+            state.inlineAddedCount = (state.inlineAddedCount || 0) + 1;
+            state.inlinePendingFile = undefined;
+            state.step = "inline_awaiting_audio";
+            await bot.sendMessage(msg.chat.id, `✅ Added with cover art! (${state.inlineAddedCount} total) Send the next song, or /done when finished.`);
+          } catch (err) {
+            logger.error({ err }, "Error saving inline audio with thumbnail");
+            await safeSendMessage(bot, msg.chat.id, "⚠️ Something went wrong saving that file. Please try again.");
+          }
+        } else if ((msg.text || "").trim().toLowerCase() === "skip") {
+          try {
+            await db.insert(inlineAudioFilesTable).values({
+              fileUniqueId: pending.fileUniqueId,
+              fileId: pending.fileId,
+              title: pending.title || null,
+              performer: pending.performer || null,
+              fileName: pending.fileName || null,
+              duration: pending.duration || null,
+              searchText,
+            }).onConflictDoUpdate({
+              target: inlineAudioFilesTable.fileUniqueId,
+              set: { fileId: pending.fileId, title: pending.title || null, performer: pending.performer || null, fileName: pending.fileName || null, duration: pending.duration || null, searchText, addedAt: new Date() },
+            });
+            state.inlineAddedCount = (state.inlineAddedCount || 0) + 1;
+            state.inlinePendingFile = undefined;
+            state.step = "inline_awaiting_audio";
+            await bot.sendMessage(msg.chat.id, `✅ Added without cover art. (${state.inlineAddedCount} total) Send the next song, or /done when finished.`);
+          } catch (err) {
+            logger.error({ err }, "Error saving inline audio without thumbnail");
+            await safeSendMessage(bot, msg.chat.id, "⚠️ Something went wrong saving that file. Please try again.");
+          }
+        } else {
+          await safeSendMessage(bot, msg.chat.id, `Please send a photo as the cover art, or type "skip" to add without.`);
         }
         return;
       }
